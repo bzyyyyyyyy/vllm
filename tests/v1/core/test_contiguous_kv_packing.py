@@ -68,6 +68,9 @@ def _mock_vllm_config():
     config = MagicMock()
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.kv_cache_layout = None
+    # These tests pin explicit layouts for the direct packing; the extensible
+    # KV cache would force a block-outermost layout for mixed page sizes.
+    config.cache_config.enable_extensible_kv_cache = False
     return config
 
 
