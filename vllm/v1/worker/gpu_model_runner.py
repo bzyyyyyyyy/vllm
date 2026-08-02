@@ -125,7 +125,7 @@ from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.extensible_tensor import (
     ExtensibleKVCacheBuffers,
-    ExtensibleTensor,
+    ExtensibleKVCacheBuilder,
 )
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv, round_up
@@ -7494,23 +7494,15 @@ class GPUModelRunner(
                 kernel_block_sizes,
             )
 
-        buffers: list[tuple[ExtensibleTensor, int]] = []
-        num_blocks = kv_cache_config.num_blocks
-
-        def reserve(size: int, num_segments: int) -> torch.Tensor:
-            buffer = ExtensibleTensor(
-                max_num_bytes=size,
-                device=self.device,
-                num_segments=num_segments,
-            )
-            buffers.append((buffer, size // (num_blocks * num_segments)))
-            return buffer.full_view()
-
+        builder = ExtensibleKVCacheBuilder(kv_cache_config.num_blocks, self.device)
         kv_caches = allocate_and_reshape_kv_cache(
-            kv_cache_config, self.device, layout, kernel_block_sizes, reserve=reserve
+            kv_cache_config,
+            self.device,
+            layout,
+            kernel_block_sizes,
+            reserve=builder.reserve,
         )
-        self.extensible_kv_buffers = ExtensibleKVCacheBuffers(buffers, num_blocks)
-        self.extensible_kv_buffers.commit(1)
+        self.extensible_kv_buffers = builder.finish()
         return kv_caches
 
     def extend_kv_cache(self, num_blocks: int, defragment: bool = False) -> None:
