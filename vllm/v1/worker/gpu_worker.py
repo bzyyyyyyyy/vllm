@@ -63,6 +63,7 @@ from vllm.profiler.wrapper import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.extensible_tensor import granule_size
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
@@ -424,6 +425,25 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
+            # Resolve the extensible-KV driver gate before memory profiling:
+            # the gate lowers gpu_memory_utilization back to the standard
+            # default, so sizing must not run against the extensible defaults
+            # on a fallback path. Each worker resolves against its own driver;
+            # the engine applies the same gate to its own config copy via the
+            # extensible_kv_cache_unsupported_reason RPC.
+            cache_config = self.cache_config
+            if (
+                cache_config.enable_extensible_kv_cache
+                and not cache_config.user_specified_enable_extensible_kv_cache
+                and (reason := self.extensible_kv_cache_unsupported_reason())
+            ):
+                logger.info_once(
+                    "Not using the extensible KV cache: %s. KV cache sizing "
+                    "will use profiling estimates instead of measured usage.",
+                    reason,
+                )
+                cache_config.disable_extensible_kv_cache()
+
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
@@ -566,6 +586,7 @@ class Worker(WorkerBase):
         )
 
         self.total_consumed = profile_result.total_consumed
+        self.transient_peak_headroom = profile_result.transient_peak_headroom
         self.peak_activation_memory = (
             profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
         )
@@ -588,6 +609,25 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        if self.cache_config.enable_extensible_kv_cache:
+            # The utilization budget is a fraction of *total* memory, so as it
+            # approaches 1 it can exceed what is actually free. Warmup
+            # physically commits a prefix of this size before CUDA graph
+            # capture, so bound it by measured free memory less the activation
+            # peak warmup re-creates. The post-warmup resize, which measures
+            # rather than estimates, sets the final size regardless.
+            # VMM commits round every layout segment up to the allocation
+            # granule; segments are per layer slot (at most two head planes
+            # each), so reserve that worst case up front.
+            granule = granule_size(getattr(self.device, "index", 0) or 0)
+            num_layers = self.model_config.get_num_layers(self.parallel_config)
+            commit_rounding = (2 * num_layers + 4) * granule
+            self.available_kv_cache_memory_bytes = min(
+                self.available_kv_cache_memory_bytes,
+                free_gpu_memory
+                - profile_result.transient_peak_headroom
+                - commit_rounding,
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
@@ -882,7 +922,11 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            warmup_kernels(
+                self.model_runner,  # type: ignore[arg-type]  # V2 runner here
+                self.execute_model,
+                self.sample_tokens,
+            )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -924,11 +968,23 @@ class Worker(WorkerBase):
                 - free_memory
                 - self.model_runner.kv_cache_committed_bytes
             )
-            post_warmup_available = int(self.requested_memory) - non_kv_used_memory
+            # Honor the utilization budget without claiming more than is
+            # free: the budget is a fraction of *total* memory, so it can
+            # exceed what was free at the initial snapshot (this worker's
+            # context and comm buffers were already resident) -- harmless at
+            # the default utilization, an over-commitment as it approaches 1.
+            post_warmup_available = min(
+                int(self.requested_memory) - non_kv_used_memory,
+                free_memory + self.model_runner.kv_cache_committed_bytes,
+            )
             warmup_memory_bytes = max(
                 cuda_graph_memory_bytes,
                 int(self.available_kv_cache_memory_bytes) - post_warmup_available,
             )
+            # Reserve for granule rounding when the final size is committed.
+            buffers = self.model_runner.extensible_kv_buffers
+            if buffers is not None:
+                warmup_memory_bytes += buffers.commit_rounding_overhead
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
@@ -970,6 +1026,7 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
             warmup_memory=warmup_memory_bytes,
+            transient_peak_headroom=getattr(self, "transient_peak_headroom", 0),
         )
 
     def reset_mm_cache(self) -> None:
