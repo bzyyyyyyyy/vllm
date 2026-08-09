@@ -920,6 +920,7 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
+        original_encoder_budget = self.scheduler_config.max_num_encoder_input_tokens
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(
@@ -1022,11 +1023,18 @@ class Worker(WorkerBase):
         # intra-op parallelism.
         set_torch_threads_for_runtime()
 
+        # Encoder warmup may have reduced the budget to fit memory.
+        fitted_encoder_budget = self.scheduler_config.max_num_encoder_input_tokens
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
             warmup_memory=warmup_memory_bytes,
             transient_peak_headroom=getattr(self, "transient_peak_headroom", 0),
+            encoder_budget_tokens=(
+                fitted_encoder_budget
+                if fitted_encoder_budget != original_encoder_budget
+                else None
+            ),
         )
 
     def reset_mm_cache(self) -> None:

@@ -21,6 +21,8 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec, MambaSpec
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.prompt_logprob import PROMPT_LOGPROBS_CHUNK_SIZE
 
 logger = init_logger(__name__)
 
@@ -203,6 +205,35 @@ def run_mixed_prefill_decode_warmup(
 
 
 @torch.inference_mode()
+def _warmup_prompt_logprobs(model_runner) -> None:
+    """Exercise one worst-case prompt-logprobs chunk.
+
+    Prompt logprobs materialize full-vocab logits in fixed-size chunks at
+    runtime; nothing else in warmup allocates that shape, so without this the
+    first prompt-logprobs request carves it out of the post-measurement
+    margin (and its repeated alloc/free fragments the allocator).
+    """
+    if not model_runner.is_last_pp_rank:
+        return
+    max_logprobs = model_runner.model_config.max_logprobs
+    if max_logprobs == 0:
+        return
+    device = model_runner.device
+    hidden = torch.zeros(
+        PROMPT_LOGPROBS_CHUNK_SIZE,
+        model_runner.model_config.get_hidden_size(),
+        dtype=model_runner.model_config.dtype,
+        device=device,
+    )
+    logits = model_runner.model.compute_logits(hidden)
+    token_ids = torch.zeros(
+        PROMPT_LOGPROBS_CHUNK_SIZE, dtype=torch.int64, device=device
+    )
+    num_logprobs = logits.shape[-1] if max_logprobs == -1 else max_logprobs
+    compute_topk_scores(logits, num_logprobs, token_ids)
+    torch.accelerator.synchronize()
+
+
 def warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -214,7 +245,10 @@ def warmup_kernels(
     coordination.
     """
     if model_runner.is_encoder_only:
+        model_runner.warmup_multimodal_encoder()
         return
+
+    _warmup_prompt_logprobs(model_runner)
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
@@ -273,6 +307,12 @@ def warmup_kernels(
     # With the extensible KV cache, only a prefix of the blocks is physically
     # committed so far; commit the prefix this warmup writes to.
     model_runner.ensure_kv_cache_blocks(1 + num_reqs * max_blocks_per_req)
+
+    # Re-runs the worst-case encoder pass (JIT-compiling the vision tower)
+    # and keeps its memory resident for the post-warmup measured KV sizing
+    # (profiling's pass is empty_cache'd). After the KV commit above, so the
+    # encoder budget fitting sees the memory warmup actually holds.
+    model_runner.warmup_multimodal_encoder()
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
