@@ -386,7 +386,7 @@ steps:
 
 #-------------------------------------------------------------  mi250 · misc  ------------------------------------------------------------#
 
-- label: Async Engine, Inputs, Utils, Worker, Config (1 GPU) # TBD
+- label: Async Engine, Inputs, Utils, Worker, Config (CPU) # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx90anightly, amdmi250]
   dind: false
