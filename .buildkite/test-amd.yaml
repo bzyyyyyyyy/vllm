@@ -324,10 +324,14 @@ steps:
   source_file_dependencies:
   - vllm/v1/
   - tests/v1/engine/
+  - tests/config/test_mp_reducer.py
+  - vllm/transformers_utils/config.py
+  - vllm/engine/arg_utils.py
   - vllm/platforms/rocm.py
   commands:
   - pytest -v -s v1/engine/test_preprocess_error_handling.py
   - pytest -v -s v1/engine --ignore v1/engine/test_preprocess_error_handling.py
+  - pytest -v -s config/test_mp_reducer.py
 
 - label: Spec Decode Draft Model # TBD
   timeout_in_minutes: 180
@@ -424,7 +428,7 @@ steps:
   - pytest -v -s tool_parsers
   - pytest -v -s parser
   - pytest -v -s transformers_utils
-  - pytest -v -s config
+  - pytest -v -s config --ignore=config/test_mp_reducer.py
 
 - label: Python-only Installation # TBD
   timeout_in_minutes: 180

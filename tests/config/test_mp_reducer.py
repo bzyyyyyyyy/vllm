@@ -4,19 +4,33 @@ import sys
 from unittest.mock import patch
 
 from vllm.config import VllmConfig
-from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
 
 
 def test_mp_reducer():
-    """Test VllmConfig reducer registration without transformers_modules.
-
-    This is a regression test for https://github.com/vllm-project/vllm/pull/19510.
     """
-    with (
-        patch.dict(sys.modules, {"transformers_modules": None}),
-        patch("multiprocessing.reducer.register") as mock_register,
-    ):
-        maybe_register_config_serialize_by_value()
+    Test that _reduce_config reducer is registered when AsyncLLM is instantiated
+    without transformers_modules. This is a regression test for
+    https://github.com/vllm-project/vllm/pull/18640.
+    """
+
+    # Ensure transformers_modules is not in sys.modules
+    if "transformers_modules" in sys.modules:
+        del sys.modules["transformers_modules"]
+
+    with patch("multiprocessing.reducer.register") as mock_register:
+        engine_args = AsyncEngineArgs(
+            model="facebook/opt-125m",
+            max_model_len=32,
+            gpu_memory_utilization=0.1,
+            disable_log_stats=True,
+        )
+
+        async_llm = AsyncLLM.from_engine_args(
+            engine_args,
+            start_engine_loop=False,
+        )
 
         assert mock_register.called, (
             "multiprocessing.reducer.register should have been called"
@@ -35,3 +49,5 @@ def test_mp_reducer():
         assert vllm_config_registered, (
             "VllmConfig should have been registered to multiprocessing.reducer"
         )
+
+        async_llm.shutdown()
