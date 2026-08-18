@@ -189,6 +189,57 @@ def test_import_preflight_rejects_broken_pytest_plugin_registration(tmp_path: Pa
     assert document["pytest_plugin_exit_code"] != 0
 
 
+def test_import_preflight_rejects_unknown_pytest_hook(tmp_path: Path):
+    installed_package = tmp_path / "site-packages" / "vllm"
+    installed_package.mkdir(parents=True)
+    (installed_package / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "unknown_hook_plugin.py").write_text(
+        "def pytest_vllm_ci_unknown_hook():\n    pass\n", encoding="utf-8"
+    )
+    output = tmp_path / "import-environment.json"
+    environment = {
+        "PYTHONPATH": os.pathsep.join([str(installed_package.parent), str(tmp_path)]),
+        "PYTEST_PLUGINS": "unknown_hook_plugin",
+    }
+
+    status = validate_import_environment(
+        command_cwd=tmp_path,
+        environment=environment,
+        output_path=output,
+        repo_root=tmp_path / "image-workspace",
+    )
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert status != 0
+    assert document["error"] == "pytest plugin/options preflight failed"
+    assert document["import_exit_code"] == 0
+    assert document["pytest_plugin_exit_code"] != 0
+
+
+def test_import_preflight_rejects_unsupported_pytest_option(tmp_path: Path):
+    installed_package = tmp_path / "site-packages" / "vllm"
+    installed_package.mkdir(parents=True)
+    (installed_package / "__init__.py").write_text("", encoding="utf-8")
+    output = tmp_path / "import-environment.json"
+    environment = {
+        "PYTHONPATH": str(installed_package.parent),
+        "PYTEST_ADDOPTS": "--vllm-ci-unsupported-option",
+    }
+
+    status = validate_import_environment(
+        command_cwd=tmp_path,
+        environment=environment,
+        output_path=output,
+        repo_root=tmp_path / "image-workspace",
+    )
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert status != 0
+    assert document["error"] == "pytest plugin/options preflight failed"
+    assert document["import_exit_code"] == 0
+    assert document["pytest_plugin_exit_code"] != 0
+
+
 def test_deep_python_trace_records_ordered_repository_calls(tmp_path: Path):
     repo = tmp_path / "repo"
     package = repo / "vllm"

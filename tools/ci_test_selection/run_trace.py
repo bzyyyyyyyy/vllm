@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -337,14 +338,42 @@ def validate_import_environment(
         pytest_environment = dict(preflight_environment)
         pytest_environment["VLLM_CI_TEST_SELECTION_DEEP_TRACE"] = "0"
         pytest_environment.pop("VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR", None)
-        pytest_result = subprocess.run(
-            [sys.executable, "-m", "pytest", "--help"],
-            cwd=command_cwd,
-            env=pytest_environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        # ``pytest --help`` exits before pluggy validates hooks and before
+        # pytest parses every injected option. Collect one inert test under the
+        # exact command environment so a bad plugin or unavailable option
+        # triggers the uninstrumented fallback before the production command
+        # is marked started. Keep all preflight evidence in a temporary
+        # directory so collection cannot contaminate the real trace outputs.
+        with tempfile.TemporaryDirectory(
+            prefix=".pytest-preflight-", dir=output_path.parent
+        ) as temporary_directory:
+            pytest_preflight_dir = Path(temporary_directory)
+            pytest_target = pytest_preflight_dir / "test_preflight.py"
+            pytest_target.write_text(
+                "def test_vllm_ci_test_selection_preflight():\n    pass\n",
+                encoding="utf-8",
+            )
+            pytest_environment["COVERAGE_FILE"] = str(
+                pytest_preflight_dir / ".coverage"
+            )
+            pytest_environment["VLLM_CI_TEST_SELECTION_NODEIDS"] = str(
+                pytest_preflight_dir / "pytest-nodes.json"
+            )
+            pytest_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "--collect-only",
+                    "--quiet",
+                    str(pytest_target),
+                ],
+                cwd=command_cwd,
+                env=pytest_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         status = _shell_exit_code(pytest_result.returncode)
         document["pytest_plugin_exit_code"] = status
         if status != 0:
