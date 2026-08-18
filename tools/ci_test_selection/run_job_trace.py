@@ -9,7 +9,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -95,6 +94,15 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--capture-gpu", action="store_true")
     mode.add_argument("--deep-gpu", action="store_true")
     mode.add_argument("--python-only", action="store_true")
+    parser.add_argument(
+        "--preserve-command-exit-code",
+        action="store_true",
+        help=(
+            "Return the existing job command's status even when collection or "
+            "export fails. If collection fails before starting the command, run "
+            "that command once without instrumentation."
+        ),
+    )
     return parser
 
 
@@ -159,22 +167,22 @@ def _job_document(path: Path) -> dict[str, Any] | None:
     return document if isinstance(document, dict) else None
 
 
-def _upload_artifacts(pattern: str) -> int | None:
-    if not os.environ.get("BUILDKITE"):
-        return None
-    if not shutil.which("buildkite-agent"):
-        return 127
-    result = subprocess.run(
-        ["buildkite-agent", "artifact", "upload", pattern],
+def _run_uninstrumented(command: str, cwd: Path) -> subprocess.CompletedProcess[Any]:
+    print(
+        "Trace collector did not start the command; running it uninstrumented.",
+        file=sys.stderr,
+    )
+    return subprocess.run(
+        ["bash", "-lc", command],
+        cwd=cwd,
+        env=dict(os.environ),
         check=False,
     )
-    return result.returncode
 
 
 def main() -> int:
     args = _parser().parse_args()
     commands = decode_commands(args.commands_base64)
-    artifact_pattern = str(args.output_dir / "**/*")
     output_dir = args.output_dir.resolve()
     repo_root = args.repo_root.resolve()
     command_cwd = Path.cwd().resolve()
@@ -184,33 +192,91 @@ def main() -> int:
     return_code = 0
     for index, command in enumerate(commands):
         capture_gpu = args.capture_gpu or args.deep_gpu
-        result = _run_command(
-            command,
-            command_index=index,
-            job_key=args.job_key,
-            command_cwd=command_cwd,
-            output_dir=output_dir,
-            repo_root=repo_root,
-            represented_job_key=args.represented_job_key,
-            capture_gpu=capture_gpu,
-            deep_gpu=args.deep_gpu,
+        collector_error = None
+        try:
+            result = _run_command(
+                command,
+                command_index=index,
+                job_key=args.job_key,
+                command_cwd=command_cwd,
+                output_dir=output_dir,
+                repo_root=repo_root,
+                represented_job_key=args.represented_job_key,
+                capture_gpu=capture_gpu,
+                deep_gpu=args.deep_gpu,
+            )
+        except Exception as error:
+            collector_error = f"{type(error).__name__}: {error}"
+            result = subprocess.CompletedProcess([], 1)
+        command_output = output_dir / "commands" / f"{index:03d}"
+        shard_job = _job_document(command_output / "job.json")
+        command_status = _job_document(command_output / "command-status.json")
+        command_executed = bool(shard_job and shard_job.get("command_executed"))
+        command_exit_code = (
+            int(shard_job["pytest_exit_code"])
+            if command_executed and isinstance(shard_job.get("pytest_exit_code"), int)
+            else None
         )
-        shard_job = _job_document(output_dir / "commands" / f"{index:03d}" / "job.json")
+        if (
+            command_exit_code is None
+            and command_status
+            and command_status.get("command_executed") is True
+            and command_status.get("phase") == "finished"
+            and isinstance(command_status.get("exit_code"), int)
+        ):
+            command_executed = True
+            command_exit_code = int(command_status["exit_code"])
+        command_started = bool(
+            command_status
+            and command_status.get("command_executed") is True
+            and command_status.get("phase") in ("started", "finished")
+        )
+        fallback_uninstrumented = False
+        if (
+            args.preserve_command_exit_code
+            and command_exit_code is None
+            and not command_started
+        ):
+            fallback = _run_uninstrumented(command, command_cwd)
+            command_exit_code = fallback.returncode
+            fallback_uninstrumented = True
+        effective_exit_code = (
+            command_exit_code
+            if args.preserve_command_exit_code and command_exit_code is not None
+            else result.returncode
+        )
         command_results.append(
             {
                 "command_index": index,
                 "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
-                "exit_code": result.returncode,
-                "healthy": bool(shard_job and shard_job.get("healthy") is True),
+                "collector_error": collector_error,
+                "collector_exit_code": result.returncode,
+                "command_exit_code": command_exit_code,
+                "fallback_uninstrumented": fallback_uninstrumented,
+                "healthy": bool(
+                    result.returncode == 0
+                    and shard_job
+                    and shard_job.get("healthy") is True
+                ),
             }
         )
-        if result.returncode != 0:
-            return_code = result.returncode
+        if effective_exit_code != 0:
+            return_code = effective_exit_code
             break
 
     healthy = len(command_results) == len(commands) and all(
-        result["exit_code"] == 0 and result["healthy"] for result in command_results
+        result["command_exit_code"] == 0 and result["healthy"]
+        for result in command_results
     )
+    static_build_provenance = None
+    static_build_provenance_error = None
+    try:
+        static_build_provenance = static_build_provenance_reference(
+            args.build_graph_dir
+        )
+    except (Exception, SystemExit) as error:
+        static_build_provenance_error = f"{type(error).__name__}: {error}"
+        healthy = False
     summary_path = output_dir / "trace-job.json"
     _atomic_json(
         summary_path,
@@ -228,17 +294,18 @@ def main() -> int:
             "created_at": datetime.now(UTC).isoformat(),
             "healthy": healthy,
             "job_key": args.job_key,
-            "represented_job_key": args.represented_job_key,
-            "static_build_provenance": static_build_provenance_reference(
-                args.build_graph_dir
+            "parallel_job": int(os.environ.get("BUILDKITE_PARALLEL_JOB", "0")),
+            "parallel_job_count": int(
+                os.environ.get("BUILDKITE_PARALLEL_JOB_COUNT", "1")
             ),
+            "repository_sha": os.environ.get("BUILDKITE_COMMIT"),
+            "represented_job_key": args.represented_job_key,
+            "static_build_provenance": static_build_provenance,
+            "static_build_provenance_error": static_build_provenance_error,
         },
     )
-    upload_status = _upload_artifacts(artifact_pattern)
-    if not healthy and return_code == 0:
+    if not healthy and return_code == 0 and not args.preserve_command_exit_code:
         return_code = 1
-    if upload_status not in (None, 0) and return_code == 0:
-        return_code = upload_status
     return return_code
 
 

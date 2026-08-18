@@ -113,6 +113,7 @@ def test_deep_environment_disables_pytest_assertion_rewriting(
         "--cov-report=",
         "--assert=plain",
     ]
+    assert environment["VLLM_CI_TEST_SELECTION_PACKAGE"] == ("tools.ci_test_selection")
 
 
 def test_import_preflight_rejects_checkout_source_for_image_job(tmp_path: Path):

@@ -216,6 +216,7 @@ def _command_environment(
 
     if auto_load_pytest:
         package = __package__ or "ci_test_selection"
+        environment["VLLM_CI_TEST_SELECTION_PACKAGE"] = package
         plugins = [
             f"{package}.pytest_trace_plugin",
             f"{package}.nvtx_test_ranges",
@@ -247,6 +248,7 @@ def _command_environment(
 
 
 _IMPORT_PREFLIGHT = r"""
+import importlib
 import json
 import os
 from pathlib import Path
@@ -259,6 +261,14 @@ document = {
     "vllm_file": None,
 }
 try:
+    import coverage
+    import pytest
+    import pytest_cov
+
+    package = os.environ.get("VLLM_CI_TEST_SELECTION_PACKAGE")
+    if package:
+        importlib.import_module(f"{package}.pytest_trace_plugin")
+        importlib.import_module(f"{package}.nvtx_test_ranges")
     import vllm
 
     resolved = Path(vllm.__file__).resolve()
@@ -363,6 +373,7 @@ def main() -> int:
     call_trace_file = output_dir / "python-call-trace.jsonl"
     call_trace_dir = output_dir / "python-call-shards"
     job_file = output_dir / "job.json"
+    command_status_file = output_dir / "command-status.json"
     repository_sha = _git_sha(args.repo_root)
 
     deep_trace = os.environ.get("VLLM_CI_TEST_SELECTION_DEEP_TRACE") == "1"
@@ -390,14 +401,33 @@ def main() -> int:
         repo_root=args.repo_root,
     )
     if preflight_status == 0:
+        _atomic_json(
+            command_status_file,
+            {
+                "command_executed": True,
+                "created_at": datetime.now(UTC).isoformat(),
+                "exit_code": None,
+                "phase": "started",
+            },
+        )
         result = subprocess.run(
             command,
             cwd=command_cwd,
             env=environment,
             check=False,
         )
+        _atomic_json(
+            command_status_file,
+            {
+                "command_executed": True,
+                "created_at": datetime.now(UTC).isoformat(),
+                "exit_code": result.returncode,
+                "phase": "finished",
+            },
+        )
     else:
         result = subprocess.CompletedProcess(command, preflight_status)
+    command_executed = preflight_status == 0
 
     rows = (
         coverage_rows(
@@ -441,6 +471,7 @@ def main() -> int:
                 else None
             ),
             "command_cwd": str(command_cwd),
+            "command_executed": command_executed,
             "created_at": datetime.now(UTC).isoformat(),
             "healthy": healthy,
             "image_tag": os.environ.get("IMAGE_TAG"),

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pybase64 as base64
 import pytest
 
+import tools.ci_test_selection.run_job_trace as run_job_trace
 from tools.ci_test_selection.nvtx_test_ranges import _configured_nvtx
 from tools.ci_test_selection.run_job_trace import (
     decode_commands,
@@ -164,3 +165,256 @@ def test_python_only_job_preserves_pytest_command_and_collects_trace(tmp_path: P
     summary = json.loads((output / "trace-job.json").read_text())
     assert summary["healthy"] is True
     assert summary["capture_mode"] == "python-only"
+
+
+@pytest.mark.parametrize(
+    "command,expected_status",
+    [
+        ("echo original-command-ran", 0),
+        ("echo original-command-ran && exit 7", 7),
+    ],
+)
+def test_in_place_collection_preserves_original_command_status(
+    tmp_path: Path, command: str, expected_status: int
+):
+    repo = tmp_path / "repo"
+    package = repo / "vllm"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    output = tmp_path / "trace"
+    project_root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ)
+    environment["BUILDKITE_COMMIT"] = "c" * 40
+    environment["PYTHONPATH"] = str(project_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.ci_test_selection.run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload([command]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+        cwd=repo,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == expected_status
+    summary = json.loads((output / "trace-job.json").read_text())
+    assert summary["command_results"][0]["command_exit_code"] == expected_status
+    assert summary["healthy"] is False
+
+
+def test_in_place_collection_falls_back_only_when_preflight_never_started_command(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    package = repo / "vllm"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('preflight failure')\n", encoding="utf-8"
+    )
+    marker = repo / "original-ran"
+    output = tmp_path / "trace"
+    project_root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ)
+    environment["BUILDKITE_COMMIT"] = "d" * 40
+    environment["PYTHONPATH"] = str(project_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.ci_test_selection.run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload(["touch original-ran"]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+        cwd=repo,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert marker.is_file()
+    summary = json.loads((output / "trace-job.json").read_text())
+    assert summary["command_results"][0]["fallback_uninstrumented"] is True
+    assert summary["command_results"][0]["command_exit_code"] == 0
+
+
+def test_finished_command_status_survives_later_collector_crash(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "trace"
+
+    def fake_run_command(*_args, command_index, output_dir, **_kwargs):
+        command_output = output_dir / "commands" / f"{command_index:03d}"
+        command_output.mkdir(parents=True)
+        (command_output / "command-status.json").write_text(
+            json.dumps(
+                {
+                    "command_executed": True,
+                    "exit_code": 0,
+                    "phase": "finished",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], 13)
+
+    def unexpected_fallback(*_args, **_kwargs):
+        raise AssertionError("a completed command was rerun")
+
+    monkeypatch.setattr(run_job_trace, "_run_command", fake_run_command)
+    monkeypatch.setattr(run_job_trace, "_run_uninstrumented", unexpected_fallback)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload(["pytest tests/test_one.py"]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+    )
+
+    assert run_job_trace.main() == 0
+    summary = json.loads((output / "trace-job.json").read_text())
+    assert summary["command_results"][0]["collector_exit_code"] == 13
+    assert summary["command_results"][0]["command_exit_code"] == 0
+    assert summary["command_results"][0]["fallback_uninstrumented"] is False
+
+
+def test_started_command_is_not_rerun_when_collector_status_is_unknown(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "trace"
+
+    def fake_run_command(*_args, command_index, output_dir, **_kwargs):
+        command_output = output_dir / "commands" / f"{command_index:03d}"
+        command_output.mkdir(parents=True)
+        (command_output / "command-status.json").write_text(
+            json.dumps({"command_executed": True, "phase": "started"}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], 13)
+
+    def unexpected_fallback(*_args, **_kwargs):
+        raise AssertionError("a started command was rerun")
+
+    monkeypatch.setattr(run_job_trace, "_run_command", fake_run_command)
+    monkeypatch.setattr(run_job_trace, "_run_uninstrumented", unexpected_fallback)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload(["pytest tests/test_one.py"]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+    )
+
+    assert run_job_trace.main() == 13
+    summary = json.loads((output / "trace-job.json").read_text())
+    assert summary["command_results"][0]["command_exit_code"] is None
+    assert summary["command_results"][0]["fallback_uninstrumented"] is False
+
+
+def test_static_provenance_export_failure_does_not_change_command_status(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "trace"
+
+    def fake_run_command(*_args, command_index, output_dir, **_kwargs):
+        command_output = output_dir / "commands" / f"{command_index:03d}"
+        command_output.mkdir(parents=True)
+        (command_output / "command-status.json").write_text(
+            json.dumps(
+                {
+                    "command_executed": True,
+                    "exit_code": 0,
+                    "phase": "finished",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], 0)
+
+    def fail_static_provenance(*_args, **_kwargs):
+        raise RuntimeError("broken static provenance")
+
+    monkeypatch.setattr(run_job_trace, "_run_command", fake_run_command)
+    monkeypatch.setattr(
+        run_job_trace,
+        "static_build_provenance_reference",
+        fail_static_provenance,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload(["pytest tests/test_one.py"]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+    )
+
+    assert run_job_trace.main() == 0
+    summary = json.loads((output / "trace-job.json").read_text())
+    assert summary["healthy"] is False
+    assert "broken static provenance" in summary["static_build_provenance_error"]
