@@ -1346,7 +1346,17 @@ def test_inflight_prefix_waits_for_output_before_cache_hit(async_scheduling):
     assert output.num_scheduled_tokens[consumer.request_id] == 1
 
 
-def test_inflight_partial_prefix_starts_before_producer_finishes():
+@pytest.mark.parametrize(
+    "producer_is_pin", [False, True], ids=["request-producer", "pin-producer"]
+)
+@pytest.mark.parametrize(
+    "consumer_is_pin", [False, True], ids=["request-consumer", "pin-consumer"]
+)
+def test_inflight_partial_prefix_starts_before_producer_finishes(
+    producer_is_pin: bool,
+    consumer_is_pin: bool,
+):
+    """A dependent request or pin starts once its shared blocks are ready."""
     scheduler = create_scheduler(
         enable_prefix_caching=True,
         block_size=4,
@@ -1368,9 +1378,18 @@ def test_inflight_partial_prefix_starts_before_producer_finishes():
         req_ids=["consumer"],
     )[0]
 
-    scheduler.add_request(producer)
+    producer_future = None
+    if producer_is_pin:
+        producer_future = scheduler.pin_prefix("producer-pin", producer)
+    else:
+        scheduler.add_request(producer)
     first_output = scheduler.schedule()
-    scheduler.add_request(consumer)
+
+    consumer_future = None
+    if consumer_is_pin:
+        consumer_future = scheduler.pin_prefix("consumer-pin", consumer)
+    else:
+        scheduler.add_request(consumer)
     second_output = scheduler.schedule()
     assert consumer.request_id not in second_output.num_scheduled_tokens
     assert consumer.status == RequestStatus.WAITING_FOR_PREFIX
@@ -1381,8 +1400,15 @@ def test_inflight_partial_prefix_starts_before_producer_finishes():
 
     output = scheduler.schedule()
     assert output.num_scheduled_tokens[producer.request_id] == 4
-    assert output.num_scheduled_tokens[consumer.request_id] == 1
+    if consumer_is_pin:
+        assert consumer.request_id not in output.num_scheduled_tokens
+        assert consumer_future is not None
+        assert consumer_future.result()["pinned_tokens"] == 8
+    else:
+        assert output.num_scheduled_tokens[consumer.request_id] == 1
     assert producer.num_computed_tokens < producer.num_prompt_tokens
+    if producer_future is not None:
+        assert not producer_future.done()
 
 
 def test_inflight_prefix_reelects_after_producer_abort():
