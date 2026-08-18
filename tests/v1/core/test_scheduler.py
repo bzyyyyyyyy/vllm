@@ -1359,6 +1359,7 @@ def test_inflight_partial_prefix_starts_before_producer_finishes(
     """A dependent request or pin starts once its shared blocks are ready."""
     scheduler = create_scheduler(
         enable_prefix_caching=True,
+        max_num_seqs=2,
         block_size=4,
         max_num_batched_tokens=8,
         long_prefill_token_threshold=4,
