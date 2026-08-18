@@ -39,6 +39,7 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.inflight_prefix import InFlightPrefixTracker
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -337,6 +338,8 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills: set[Request] = set()
         self._pin_prefix_futures: dict[str, Future[dict[str, Any]]] = {}
         self._pin_prefix_request_ids: dict[str, str] = {}
+        self._inflight_prefixes = InFlightPrefixTracker(self.block_size)
+        self._prefix_reservations: dict[str, list[KVCacheBlock]] = {}
 
     def _mamba_block_aligned_split(
         self,
@@ -685,12 +688,33 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 num_uncached_common_prefix_tokens = 0
+                default_max_cache_hit_length = (
+                    request.num_prompt_tokens
+                    if request.pin_prefix_id is not None
+                    else request.num_tokens - 1
+                )
+                max_cache_hit_length = default_max_cache_hit_length
+                if (
+                    self.cache_config.enable_prefix_caching
+                    and not request.skip_reading_prefix_cache
+                ):
+                    max_cache_hit_length = (
+                        self._inflight_prefixes.limit_cache_hit_length(
+                            request_id,
+                            request.block_hashes,
+                            max_cache_hit_length,
+                        )
+                    )
+                waiting_on_pending_cache = (
+                    max_cache_hit_length < default_max_cache_hit_length
+                )
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     if (
-                        self.connector is not None
+                        request.pin_prefix_id is None
+                        and self.connector is not None
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
@@ -700,7 +724,7 @@ class Scheduler(SchedulerInterface):
                         computed, per_group_hits = (
                             self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
                                 request.block_hashes,
-                                request.num_tokens - 1,
+                                max_cache_hit_length,
                             )
                         )
                         new_computed_blocks = (
@@ -716,7 +740,10 @@ class Scheduler(SchedulerInterface):
                         # the last block) is transferred unconditionally by
                         # _apply_prefix_caching in nixl/worker.py.
                         num_new_local_computed_tokens = max(per_group_hits)
-                        if self.kv_cache_manager.log_stats:
+                        if (
+                            self.kv_cache_manager.log_stats
+                            and not waiting_on_pending_cache
+                        ):
                             assert self.kv_cache_manager.prefix_cache_stats is not None
                             self.kv_cache_manager.prefix_cache_stats.record(
                                 num_tokens=request.num_tokens,
@@ -725,7 +752,11 @@ class Scheduler(SchedulerInterface):
                             )
                     else:
                         new_computed_blocks, num_new_local_computed_tokens = (
-                            self.kv_cache_manager.get_computed_blocks(request)
+                            self.kv_cache_manager.get_computed_blocks(
+                                request,
+                                max_cache_hit_length,
+                                record_stats=not waiting_on_pending_cache,
+                            )
                         )
 
                     # In case of hybrid models, obtain hint for Marconi-style APC logic
@@ -777,20 +808,60 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats is not None:
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
-                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if self.cache_config.enable_prefix_caching:
+                    waiting_for_prefix = self._inflight_prefixes.register(
+                        request_id,
+                        request.block_hashes,
+                        num_computed_tokens,
+                        request.num_prompt_tokens,
+                        default_max_cache_hit_length,
+                        wait_for_pending=not request.skip_reading_prefix_cache,
+                    )
+                    if waiting_for_prefix:
+                        request = request_queue.pop_request()
+                        request.status = RequestStatus.WAITING_FOR_PREFIX
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
+                # Track first scheduled prefill, not post-preemption repeat prefills.
+                if (
+                    request.num_computed_tokens == 0
+                    and request.prefill_stats is not None
+                ):
+                    assert num_computed_tokens <= request.num_prompt_tokens
+                    request.prefill_stats.set(
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_new_local_computed_tokens,
+                        num_external_cached_tokens=num_external_computed_tokens,
+                    )
+
+                if (
+                    request.pin_prefix_id is not None
+                    and num_new_local_computed_tokens
+                    == request.num_prompt_tokens
+                    and num_external_computed_tokens == 0
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        0,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    if new_blocks is None:
+                        break
+                    request_queue.pop_request()
+                    request.num_computed_tokens = request.num_prompt_tokens
+                    self._consume_prefix_dependency(request_id)
+                    self._complete_pin_prefix_request(request)
+                    continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -925,6 +996,8 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                self._consume_prefix_dependency(request_id)
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1165,6 +1238,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        self._remove_inflight_prefix_request(request.request_id)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1594,6 +1668,11 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            if self._inflight_prefixes.update_from_output(
+                req_id, num_tokens_scheduled
+            ):
+                self._retain_prefix_blocks(req_id)
+
             if (
                 request.pin_prefix_id is not None
                 and request.num_computed_tokens >= request.num_prompt_tokens
@@ -1883,8 +1962,60 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_PREFIX,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
+
+    def _retain_prefix_blocks(self, producer_id: str) -> None:
+        if not self._inflight_prefixes.producer_needs_reservation(producer_id):
+            return
+        retained = self._prefix_reservations.setdefault(producer_id, [])
+        retained_ids = {block.block_id for block in retained}
+        completed_tokens = self._inflight_prefixes.completed_tokens(producer_id)
+        assert completed_tokens is not None
+        completed_tokens -= completed_tokens % self.block_size
+        retained.extend(
+            self.kv_cache_manager.retain_request_blocks(
+                producer_id, completed_tokens, retained_ids
+            )
+        )
+
+    def _release_prefix_reservation(self, producer_id: str) -> None:
+        retained = self._prefix_reservations.pop(producer_id, None)
+        if retained:
+            self.kv_cache_manager.release_retained_blocks(retained)
+
+    def _maybe_release_prefix_reservation(self, producer_id: str) -> None:
+        if not self._inflight_prefixes.producer_needs_reservation(producer_id):
+            self._release_prefix_reservation(producer_id)
+
+    def _consume_prefix_dependency(self, request_id: str) -> None:
+        producer_id = self._inflight_prefixes.consume_ready_dependency(request_id)
+        if producer_id is not None:
+            self._maybe_release_prefix_reservation(producer_id)
+
+    def _remove_inflight_prefix_request(self, request_id: str) -> None:
+        completed_tokens = self._inflight_prefixes.completed_tokens(request_id)
+        if completed_tokens is not None and request_id in self.requests:
+            self.kv_cache_manager.evict_uncomputed_request_blocks(
+                request_id, completed_tokens
+            )
+        maybe_releasable = self._inflight_prefixes.remove_request(request_id)
+        maybe_releasable.add(request_id)
+        for producer_id in maybe_releasable:
+            self._maybe_release_prefix_reservation(producer_id)
+
+    def _clear_inflight_prefixes(self) -> None:
+        for producer_id in list(self._prefix_reservations):
+            self._release_prefix_reservation(producer_id)
+        self._inflight_prefixes.clear()
+        for request in self.requests.values():
+            if request.status == RequestStatus.WAITING_FOR_PREFIX:
+                request.status = (
+                    RequestStatus.PREEMPTED
+                    if request.num_preemptions
+                    else RequestStatus.WAITING
+                )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
@@ -2158,6 +2289,7 @@ class Scheduler(SchedulerInterface):
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
+            self._remove_inflight_prefix_request(request.request_id)
             if request.pin_prefix_id is not None:
                 future = self._pin_prefix_futures.pop(request.pin_prefix_id, None)
                 self._pin_prefix_request_ids.pop(request.pin_prefix_id, None)
@@ -2185,6 +2317,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._remove_inflight_prefix_request(request.request_id)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -2219,6 +2352,7 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids.add(request.request_id)
             if self.finished_req_ids_dict is not None:
                 self.finished_req_ids_dict[request.client_index].add(request.request_id)
+            self._remove_inflight_prefix_request(request.request_id)
             del self.requests[request.request_id]
             if future is not None and not future.done():
                 future.set_result(result)
@@ -2321,6 +2455,11 @@ class Scheduler(SchedulerInterface):
                 "Failed to reset prefix cache because prefix pins are pending"
             )
             return False
+        if self._inflight_prefixes.has_state() and not reset_running_requests:
+            logger.warning(
+                "Failed to reset prefix cache because prefixes are in flight"
+            )
+            return False
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -2340,6 +2479,8 @@ class Scheduler(SchedulerInterface):
                 # otherwise.
                 request.async_tokens_to_discard = request.num_output_placeholders
                 request.num_output_placeholders = 0
+
+            self._clear_inflight_prefixes()
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were
@@ -2571,6 +2712,16 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_PREFIX:
+            if self._inflight_prefixes.has_unready_dependency(request.request_id):
+                return False
+            request.status = (
+                RequestStatus.PREEMPTED
+                if request.num_preemptions
+                else RequestStatus.WAITING
+            )
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:

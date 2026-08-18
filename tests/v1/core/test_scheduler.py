@@ -1319,6 +1319,124 @@ def _model_output(scheduler, output, sampled):
     )
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_inflight_prefix_waits_for_output_before_cache_hit(async_scheduling):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+        async_scheduling=async_scheduling,
+    )
+    producer, consumer = create_requests(
+        num_requests=2,
+        num_tokens=9,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["producer", "consumer"],
+    )
+    scheduler.add_request(producer)
+    scheduler.add_request(consumer)
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {producer.request_id}
+    assert consumer.status == RequestStatus.WAITING_FOR_PREFIX
+
+    _model_output(scheduler, output, [[100]])
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[consumer.request_id] == 1
+
+
+def test_inflight_partial_prefix_starts_before_producer_finishes():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=8,
+        long_prefill_token_threshold=4,
+    )
+    producer = create_requests(
+        num_requests=1,
+        num_tokens=13,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["producer"],
+    )[0]
+    consumer = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["consumer"],
+    )[0]
+
+    scheduler.add_request(producer)
+    first_output = scheduler.schedule()
+    scheduler.add_request(consumer)
+    second_output = scheduler.schedule()
+    assert consumer.request_id not in second_output.num_scheduled_tokens
+    assert consumer.status == RequestStatus.WAITING_FOR_PREFIX
+
+    _model_output(scheduler, first_output, [[]])
+    assert consumer.status == RequestStatus.WAITING_FOR_PREFIX
+    _model_output(scheduler, second_output, [[]])
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[producer.request_id] == 4
+    assert output.num_scheduled_tokens[consumer.request_id] == 1
+    assert producer.num_computed_tokens < producer.num_prompt_tokens
+
+
+def test_inflight_prefix_reelects_after_producer_abort():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    producer, successor, waiter = create_requests(
+        num_requests=3,
+        num_tokens=9,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["producer", "successor", "waiter"],
+    )
+    for request in (producer, successor, waiter):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {producer.request_id}
+    scheduler.finish_requests(
+        producer.request_id, RequestStatus.FINISHED_ABORTED
+    )
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {successor.request_id}
+    assert waiter.status == RequestStatus.WAITING_FOR_PREFIX
+
+
+def test_pin_prefix_completes_from_ready_cache_without_model_step():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    producer, pin_request = create_requests(
+        num_requests=2,
+        num_tokens=8,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["producer", "pin-request"],
+    )
+    scheduler.add_request(producer)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]])
+
+    future = scheduler.pin_prefix("pin", pin_request)
+    output = scheduler.schedule()
+
+    assert pin_request.request_id not in output.num_scheduled_tokens
+    assert future.result()["pinned_tokens"] == 8
+    assert scheduler.kv_cache_manager.has_pinned_prefix("pin")
+
+
 def test_spec_decode_padding_first_decode_step():
     """A request taking its first decode step (whole prompt already computed via
     a prefix-cache hit) is padded with placeholder (-1) spec tokens so it enters

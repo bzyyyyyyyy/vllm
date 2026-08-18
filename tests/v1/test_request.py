@@ -11,6 +11,7 @@ def test_request_status_fmt_str():
         == "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR"
     )
     assert f"{RequestStatus.WAITING_FOR_REMOTE_KVS}" == "WAITING_FOR_REMOTE_KVS"
+    assert f"{RequestStatus.WAITING_FOR_PREFIX}" == "WAITING_FOR_PREFIX"
     assert f"{RequestStatus.WAITING_FOR_STREAMING_REQ}" == "WAITING_FOR_STREAMING_REQ"
     assert f"{RequestStatus.RUNNING}" == "RUNNING"
     assert f"{RequestStatus.PREEMPTED}" == "PREEMPTED"

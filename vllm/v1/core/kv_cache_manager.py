@@ -203,12 +203,19 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self,
+        request: Request,
+        max_cache_hit_length: int | None = None,
+        record_stats: bool = True,
+    ) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            max_cache_hit_length: Optional upper bound for the cache lookup.
+            record_stats: Whether to record this lookup in prefix-cache stats.
 
         Returns:
             A tuple containing:
@@ -222,20 +229,17 @@ class KVCacheManager:
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
-        # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        if max_cache_hit_length is None:
+            # When all tokens hit the cache, recompute the last token to obtain
+            # logits. Prefix-only requests can override this limit.
+            max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
 
-        if self.log_stats:
+        if self.log_stats and record_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
@@ -343,10 +347,14 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        if (
+            num_new_tokens == 0
+            and num_new_computed_tokens == 0
+            and num_external_computed_tokens == 0
+        ):
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
-                "external computed tokens"
+                "new computed or external computed tokens"
             )
 
         if new_computed_blocks is not None:
@@ -644,6 +652,54 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+
+    def retain_request_blocks(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        retained_block_ids: set[int],
+    ) -> list[KVCacheBlock]:
+        """Retain newly allocated blocks for an in-flight prefix waiter."""
+        computed_block_ids = {
+            block_id
+            for group_ids in self.get_block_ids_for_computed_tokens(
+                request_id, num_computed_tokens
+            )
+            for block_id in group_ids
+        }
+        retained = [
+            block
+            for blocks in self.get_blocks(request_id).blocks
+            for block in blocks
+            if (
+                not block.is_null
+                and block.block_id in computed_block_ids
+                and block.block_id not in retained_block_ids
+            )
+        ]
+        self.block_pool.touch(retained)
+        return retained
+
+    def release_retained_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        self.block_pool.free_blocks(reversed(blocks))
+
+    def evict_uncomputed_request_blocks(
+        self, request_id: str, num_computed_tokens: int
+    ) -> None:
+        computed_block_ids = {
+            block_id
+            for group_ids in self.get_block_ids_for_computed_tokens(
+                request_id, num_computed_tokens
+            )
+            for block_id in group_ids
+        }
+        uncomputed_block_ids = {
+            block.block_id
+            for blocks in self.get_blocks(request_id).blocks
+            for block in blocks
+            if not block.is_null and block.block_id not in computed_block_ids
+        }
+        self.evict_blocks(uncomputed_block_ids)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
