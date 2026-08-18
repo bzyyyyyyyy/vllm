@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pybase64 as base64
 import pytest
 
+import tools.ci_test_selection.nvtx_test_ranges as nvtx_test_ranges
+import tools.ci_test_selection.pytest_trace_plugin as pytest_trace_plugin
 import tools.ci_test_selection.run_job_trace as run_job_trace
 from tools.ci_test_selection.nvtx_test_ranges import _configured_nvtx
 from tools.ci_test_selection.run_job_trace import (
@@ -94,6 +96,37 @@ def test_python_only_nvtx_gate_does_not_initialize_cuda(monkeypatch):
     monkeypatch.setenv("VLLM_CI_TEST_SELECTION_NVTX", "0")
 
     assert _configured_nvtx() is None
+
+
+@pytest.mark.parametrize("failure", ["push", "pop"])
+def test_nvtx_tooling_failure_does_not_escape_pytest_hook(monkeypatch, failure):
+    class BrokenNvtx:
+        def range_push(self, _label):
+            if failure == "push":
+                raise RuntimeError("broken push")
+
+        def range_pop(self):
+            if failure == "pop":
+                raise RuntimeError("broken pop")
+
+    monkeypatch.setattr(nvtx_test_ranges, "_nvtx", BrokenNvtx())
+    wrapper = nvtx_test_ranges._wrap("call", SimpleNamespace(nodeid="test_node"))
+
+    next(wrapper)
+    with pytest.raises(StopIteration):
+        next(wrapper)
+
+
+def test_node_export_failure_does_not_change_pytest_result(
+    tmp_path: Path, monkeypatch, capsys
+):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("block", encoding="utf-8")
+    monkeypatch.setenv("VLLM_CI_TEST_SELECTION_NODEIDS", str(blocker / "nodes.json"))
+
+    pytest_trace_plugin.pytest_sessionfinish(SimpleNamespace(), 0)
+
+    assert "node/outcome export failed" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("document", [[], [""], {"command": "pytest"}, [1]])

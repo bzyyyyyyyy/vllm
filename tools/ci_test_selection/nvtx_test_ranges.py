@@ -16,6 +16,7 @@ copy next to conftest.py and add to plugins.
 """
 
 import os
+from contextlib import suppress
 
 import pytest
 
@@ -44,11 +45,20 @@ def _wrap(phase, item):
     if _nvtx is None:
         yield
         return
-    _nvtx.range_push(PREFIX[phase] + item.nodeid)
+    pushed = False
+    try:
+        _nvtx.range_push(PREFIX[phase] + item.nodeid)
+        pushed = True
+    except Exception:
+        # NVTX is evidence-only. A driver/tooling failure must never change
+        # the pytest phase's correctness result.
+        pass
     try:
         yield
     finally:
-        _nvtx.range_pop()
+        if pushed:
+            with suppress(Exception):
+                _nvtx.range_pop()
 
 
 @pytest.hookimpl(hookwrapper=True)
