@@ -7,5 +7,4 @@ ARG SOURCE_IMAGE
 FROM ${SOURCE_IMAGE} AS source
 
 FROM scratch
-COPY --from=source /opt/vllm-ci/build-graph/build-graph.jsonl /
-COPY --from=source /opt/vllm-ci/build-graph/kernel-map.jsonl /
+COPY --from=source /opt/vllm-ci/build-graph/ /

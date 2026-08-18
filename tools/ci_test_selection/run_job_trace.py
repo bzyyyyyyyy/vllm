@@ -39,6 +39,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _shell_exit_code(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
 def static_build_provenance_reference(
     directory: Path,
 ) -> dict[str, Any] | None:
@@ -213,7 +217,7 @@ def main() -> int:
         command_status = _job_document(command_output / "command-status.json")
         command_executed = bool(shard_job and shard_job.get("command_executed"))
         command_exit_code = (
-            int(shard_job["pytest_exit_code"])
+            _shell_exit_code(int(shard_job["pytest_exit_code"]))
             if command_executed and isinstance(shard_job.get("pytest_exit_code"), int)
             else None
         )
@@ -225,7 +229,7 @@ def main() -> int:
             and isinstance(command_status.get("exit_code"), int)
         ):
             command_executed = True
-            command_exit_code = int(command_status["exit_code"])
+            command_exit_code = _shell_exit_code(int(command_status["exit_code"]))
         command_started = bool(
             command_status
             and command_status.get("command_executed") is True
@@ -238,23 +242,24 @@ def main() -> int:
             and not command_started
         ):
             fallback = _run_uninstrumented(command, command_cwd)
-            command_exit_code = fallback.returncode
+            command_exit_code = _shell_exit_code(fallback.returncode)
             fallback_uninstrumented = True
+        collector_exit_code = _shell_exit_code(result.returncode)
         effective_exit_code = (
             command_exit_code
             if args.preserve_command_exit_code and command_exit_code is not None
-            else result.returncode
+            else collector_exit_code
         )
         command_results.append(
             {
                 "command_index": index,
                 "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
                 "collector_error": collector_error,
-                "collector_exit_code": result.returncode,
+                "collector_exit_code": collector_exit_code,
                 "command_exit_code": command_exit_code,
                 "fallback_uninstrumented": fallback_uninstrumented,
                 "healthy": bool(
-                    result.returncode == 0
+                    collector_exit_code == 0
                     and shard_job
                     and shard_job.get("healthy") is True
                 ),
@@ -278,32 +283,40 @@ def main() -> int:
         static_build_provenance_error = f"{type(error).__name__}: {error}"
         healthy = False
     summary_path = output_dir / "trace-job.json"
-    _atomic_json(
-        summary_path,
-        {
-            "capture_mode": (
-                "deep-gpu"
-                if args.deep_gpu
-                else "gpu"
-                if args.capture_gpu
-                else "python-only"
-            ),
-            "collector_version": COLLECTOR_VERSION,
-            "command_count": len(commands),
-            "command_results": command_results,
-            "created_at": datetime.now(UTC).isoformat(),
-            "healthy": healthy,
-            "job_key": args.job_key,
-            "parallel_job": int(os.environ.get("BUILDKITE_PARALLEL_JOB", "0")),
-            "parallel_job_count": int(
-                os.environ.get("BUILDKITE_PARALLEL_JOB_COUNT", "1")
-            ),
-            "repository_sha": os.environ.get("BUILDKITE_COMMIT"),
-            "represented_job_key": args.represented_job_key,
-            "static_build_provenance": static_build_provenance,
-            "static_build_provenance_error": static_build_provenance_error,
-        },
-    )
+    try:
+        parallel_job = int(os.environ.get("BUILDKITE_PARALLEL_JOB", "0"))
+        parallel_job_count = int(os.environ.get("BUILDKITE_PARALLEL_JOB_COUNT", "1"))
+        _atomic_json(
+            summary_path,
+            {
+                "capture_mode": (
+                    "deep-gpu"
+                    if args.deep_gpu
+                    else "gpu"
+                    if args.capture_gpu
+                    else "python-only"
+                ),
+                "collector_version": COLLECTOR_VERSION,
+                "command_count": len(commands),
+                "command_results": command_results,
+                "created_at": datetime.now(UTC).isoformat(),
+                "healthy": healthy,
+                "job_key": args.job_key,
+                "parallel_job": parallel_job,
+                "parallel_job_count": parallel_job_count,
+                "repository_sha": os.environ.get("BUILDKITE_COMMIT"),
+                "represented_job_key": args.represented_job_key,
+                "static_build_provenance": static_build_provenance,
+                "static_build_provenance_error": static_build_provenance_error,
+            },
+        )
+    except Exception as error:
+        print(
+            "test-selection collector job summary failed: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        healthy = False
     if not healthy and return_code == 0 and not args.preserve_command_exit_code:
         return_code = 1
     return return_code

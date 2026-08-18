@@ -52,31 +52,32 @@ setup_buildx_builder() {
         echo "Using remote driver to connect to buildkitd (warm cache available)"
         if docker buildx inspect baked-vllm-builder >/dev/null 2>&1; then
             echo "Using existing baked-vllm-builder"
-            docker buildx use baked-vllm-builder
+            docker buildx use baked-vllm-builder || return 1
         else
             echo "Creating baked-vllm-builder with remote driver"
             docker buildx create \
                 --name baked-vllm-builder \
                 --driver remote \
                 --use \
-                "unix://${BUILDKIT_SOCKET}"
+                "unix://${BUILDKIT_SOCKET}" || return 1
         fi
-        docker buildx inspect --bootstrap
+        docker buildx inspect --bootstrap || return 1
     elif docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
         # Existing builder available
         echo "Using existing builder: ${BUILDER_NAME}"
-        docker buildx use "${BUILDER_NAME}"
-        docker buildx inspect --bootstrap
+        docker buildx use "${BUILDER_NAME}" || return 1
+        docker buildx inspect --bootstrap || return 1
     else
         # No local buildkitd, no existing builder - create new docker-container builder
         echo "No local buildkitd found, using docker-container driver"
-        docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
-        docker buildx inspect --bootstrap
+        docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use \
+            || return 1
+        docker buildx inspect --bootstrap || return 1
     fi
 
     # builder info
     echo "Active builder:"
-    docker buildx ls | grep -E '^\*|^NAME' || docker buildx ls
+    docker buildx ls | grep -E '^\*|^NAME' || docker buildx ls || return 1
 }
 
 annotate_image_tags() {
@@ -117,21 +118,26 @@ publish_build_provenance() {
     fi
     echo "--- :arrow_down: Publishing immutable build provenance"
     local provenance_tmp provenance_dir created_at image_digest
-    provenance_tmp="$(mktemp -d)"
+    provenance_tmp="$(mktemp -d)" || return 1
     provenance_dir="${provenance_tmp}/ci-build-provenance"
-    mkdir -p "${provenance_dir}"
+    mkdir -p "${provenance_dir}" || return 1
     docker buildx build \
         --file docker/Dockerfile.build-provenance \
         --build-arg "SOURCE_IMAGE=${IMAGE_TAG}" \
         --output "type=local,dest=${provenance_dir}" \
-        .
-    test -s "${provenance_dir}/build-graph.jsonl"
-    test -s "${provenance_dir}/kernel-map.jsonl"
+        . || return 1
+    if [[ -f "${provenance_dir}/MISSING" ]]; then
+        echo "Static test-selection build provenance is unavailable:" >&2
+        cat "${provenance_dir}/MISSING" >&2
+        return 1
+    fi
+    test -s "${provenance_dir}/build-graph.jsonl" || return 1
+    test -s "${provenance_dir}/kernel-map.jsonl" || return 1
     # Pin the OCI index digest printed by every deployed buildx version. The
     # index covers the linux/amd64 image and its BuildKit attestation manifest;
     # `.Manifest.Digest` is not portable across older buildx clients.
-    image_digest="$(resolve_image_digest "${IMAGE_TAG}")"
-    created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    image_digest="$(resolve_image_digest "${IMAGE_TAG}")" || return 1
+    created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
     python3 tools/ci_test_selection/write_build_provenance_manifest.py \
         "${provenance_dir}" \
         --repository-sha "${BUILDKITE_COMMIT}" \
@@ -139,9 +145,31 @@ publish_build_provenance() {
         --image-digest "${image_digest}" \
         --created-at "${created_at}" \
         --buildkite-build-id "${BUILDKITE_BUILD_ID:-}" \
-        --out "${provenance_dir}/manifest.json"
+        --out "${provenance_dir}/manifest.json" || return 1
     (cd "${provenance_tmp}" && \
-        buildkite-agent artifact upload "ci-build-provenance/*")
+        buildkite-agent artifact upload "ci-build-provenance/*") || return 1
+}
+
+warn_build_provenance() {
+    local status="$1"
+    local component="$2"
+    echo "Test-selection build provenance ${component} failed with status ${status}; continuing image build." >&2
+    buildkite-agent annotate \
+        --context test-selection-build-provenance \
+        --style warning \
+        "Test-selection build provenance was unavailable. The image build continued; affected jobs remain always-run." \
+        || true
+    return 0
+}
+
+publish_build_provenance_best_effort() {
+    local status
+    if publish_build_provenance; then
+        return 0
+    else
+        status=$?
+    fi
+    warn_build_provenance "${status}" publication
 }
 
 ecr_login() {
@@ -290,8 +318,11 @@ check_and_skip_if_image_exists
 
 if [[ "${IMAGE_ALREADY_EXISTS}" == "1" ]]; then
     if [[ "${VLLM_CI_PUBLISH_BUILD_PROVENANCE:-0}" == "1" ]]; then
-        setup_buildx_builder
-        publish_build_provenance
+        if setup_buildx_builder; then
+            publish_build_provenance_best_effort
+        else
+            warn_build_provenance "$?" "builder setup"
+        fi
     fi
     annotate_image_tags
     exit 0
@@ -329,5 +360,5 @@ docker --debug buildx bake -f "${VLLM_BAKE_FILE_PATH}" -f "${CI_HCL_PATH}" --pro
 
 echo "--- :white_check_mark: Build complete"
 
-publish_build_provenance
+publish_build_provenance_best_effort
 annotate_image_tags

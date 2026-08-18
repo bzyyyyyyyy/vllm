@@ -49,6 +49,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _shell_exit_code(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
 def _merge_ordered_jsonl(paths: list[Path], output: Path) -> int:
     streams = [path.open(encoding="utf-8") for path in paths]
     heap: list[tuple[int, int, int, dict[str, Any]]] = []
@@ -326,9 +330,32 @@ def validate_import_environment(
             "stderr": stderr,
             "stdout": stdout,
         }
-    document["exit_code"] = result.returncode
+    status = _shell_exit_code(result.returncode)
+    document["import_exit_code"] = status
+    document["pytest_plugin_exit_code"] = None
+    if status == 0:
+        pytest_environment = dict(preflight_environment)
+        pytest_environment["VLLM_CI_TEST_SELECTION_DEEP_TRACE"] = "0"
+        pytest_environment.pop("VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR", None)
+        pytest_result = subprocess.run(
+            [sys.executable, "-m", "pytest", "--help"],
+            cwd=command_cwd,
+            env=pytest_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status = _shell_exit_code(pytest_result.returncode)
+        document["pytest_plugin_exit_code"] = status
+        if status != 0:
+            stderr = pytest_result.stderr.strip()
+            document["error"] = "pytest plugin/options preflight failed"
+            document["pytest_stderr"] = stderr
+            if stderr:
+                print(stderr, file=sys.stderr)
+    document["exit_code"] = status
     _atomic_json(output_path, document)
-    return result.returncode
+    return status
 
 
 def _merge_node_documents(output_dir: Path, node_file: Path) -> dict[str, Any]:
@@ -416,17 +443,19 @@ def main() -> int:
             env=environment,
             check=False,
         )
+        command_exit_code = _shell_exit_code(result.returncode)
         _atomic_json(
             command_status_file,
             {
                 "command_executed": True,
                 "created_at": datetime.now(UTC).isoformat(),
-                "exit_code": result.returncode,
+                "exit_code": command_exit_code,
                 "phase": "finished",
             },
         )
     else:
         result = subprocess.CompletedProcess(command, preflight_status)
+        command_exit_code = preflight_status
     command_executed = preflight_status == 0
 
     rows = (
@@ -455,7 +484,7 @@ def main() -> int:
     if deep_trace and not call_trace_file.exists():
         _atomic_jsonl(call_trace_file, [])
     healthy = (
-        result.returncode == 0
+        command_exit_code == 0
         and bool(node_document["collected"])
         and coverage_file.exists()
         and (not deep_trace or call_trace_rows > 0)
@@ -478,7 +507,7 @@ def main() -> int:
             "import_preflight_exit_code": preflight_status,
             "job_key": args.job_key,
             "node_ids": node_document["collected"],
-            "pytest_exit_code": result.returncode,
+            "pytest_exit_code": command_exit_code,
             "python_trace": trace_file.name,
             "python_trace_rows": len(rows),
             "python_trace_sha256": _sha256(trace_file),
@@ -491,7 +520,7 @@ def main() -> int:
             "represented_job_key": args.represented_job_key,
         },
     )
-    return result.returncode
+    return command_exit_code
 
 
 if __name__ == "__main__":

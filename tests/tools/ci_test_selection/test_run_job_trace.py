@@ -451,3 +451,123 @@ def test_static_provenance_export_failure_does_not_change_command_status(
     summary = json.loads((output / "trace-job.json").read_text())
     assert summary["healthy"] is False
     assert "broken static provenance" in summary["static_build_provenance_error"]
+
+
+def test_signal_status_uses_shell_convention(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "trace"
+
+    def fake_run_command(*_args, command_index, output_dir, **_kwargs):
+        command_output = output_dir / "commands" / f"{command_index:03d}"
+        command_output.mkdir(parents=True)
+        (command_output / "command-status.json").write_text(
+            json.dumps(
+                {
+                    "command_executed": True,
+                    "exit_code": -9,
+                    "phase": "finished",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], -9)
+
+    monkeypatch.setattr(run_job_trace, "_run_command", fake_run_command)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload(["pytest tests/test_one.py"]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+    )
+
+    assert run_job_trace.main() == 137
+    summary = json.loads((output / "trace-job.json").read_text())
+    assert summary["command_results"][0]["collector_exit_code"] == 137
+
+
+@pytest.mark.parametrize("failure", ["write", "parallel-env"])
+def test_job_summary_failure_preserves_finished_command_status(
+    tmp_path: Path, monkeypatch, capsys, failure: str
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "trace"
+
+    def fake_run_command(*_args, command_index, output_dir, **_kwargs):
+        command_output = output_dir / "commands" / f"{command_index:03d}"
+        command_output.mkdir(parents=True)
+        (command_output / "command-status.json").write_text(
+            json.dumps(
+                {
+                    "command_executed": True,
+                    "exit_code": 0,
+                    "phase": "finished",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(run_job_trace, "_run_command", fake_run_command)
+    if failure == "write":
+        monkeypatch.setattr(
+            run_job_trace,
+            "_atomic_json",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("read-only")),
+        )
+    else:
+        monkeypatch.setenv("BUILDKITE_PARALLEL_JOB", "not-an-integer")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_job_trace",
+            "--output-dir",
+            str(output),
+            "--job-key",
+            "unit",
+            "--represented-job-key",
+            "unit",
+            "--commands-base64",
+            _payload(["pytest tests/test_one.py"]),
+            "--repo-root",
+            str(repo),
+            "--python-only",
+            "--preserve-command-exit-code",
+        ],
+    )
+
+    assert run_job_trace.main() == 0
+    assert "collector job summary failed" in capsys.readouterr().err
+
+
+def test_image_build_trace_provenance_is_best_effort():
+    project_root = Path(__file__).resolve().parents[3]
+    image_build = (
+        project_root / ".buildkite" / "image_build" / "image_build.sh"
+    ).read_text(encoding="utf-8")
+    dockerfile = (project_root / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    export_dockerfile = (
+        project_root / "docker" / "Dockerfile.build-provenance"
+    ).read_text(encoding="utf-8")
+
+    assert image_build.count("publish_build_provenance_best_effort") == 3
+    assert "affected jobs remain always-run" in image_build
+    assert "if ! bash tools/ci_test_selection/export_image_build_provenance.sh" in (
+        dockerfile
+    )
+    assert "COPY --from=source /opt/vllm-ci/build-graph/ /" in export_dockerfile
