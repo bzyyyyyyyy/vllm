@@ -4,6 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from concurrent.futures import Future
 from dataclasses import replace
 from typing import Any
 
@@ -334,6 +335,8 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._pin_prefix_futures: dict[str, Future[dict[str, Any]]] = {}
+        self._pin_prefix_request_ids: dict[str, str] = {}
 
     def _mamba_block_aligned_split(
         self,
@@ -1089,6 +1092,20 @@ class Scheduler(SchedulerInterface):
                 len(num_scheduled_tokens)
             ]
 
+        prefill_only_req_ids = {
+            req_id
+            for req_id, num_scheduled in num_scheduled_tokens.items()
+            if (
+                (request := self.requests[req_id]).pin_prefix_id is not None
+                and request.num_computed_tokens + num_scheduled
+                >= request.num_prompt_tokens
+            )
+        }
+        skip_sampler = (
+            bool(num_scheduled_tokens)
+            and len(prefill_only_req_ids) == len(num_scheduled_tokens)
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1106,6 +1123,8 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            prefill_only_req_ids=prefill_only_req_ids or None,
+            skip_sampler=skip_sampler,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1575,6 +1594,15 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            if (
+                request.pin_prefix_id is not None
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                self._complete_pin_prefix_request(request)
+                if request in self.running:
+                    stopped_running_reqs.add(request)
+                continue
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -2033,6 +2061,52 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
+    def pin_prefix(self, pin_id: str, request: Request) -> Future[dict[str, Any]]:
+        if not self.cache_config.enable_prefix_caching:
+            raise RuntimeError("pin_prefix requires prefix caching to be enabled")
+        if pin_id in self._pin_prefix_futures:
+            raise ValueError(f"prefix pin already exists or is pending: {pin_id!r}")
+        if self.kv_cache_manager.has_pinned_prefix(pin_id):
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        if request.prompt_token_ids is None:
+            raise ValueError("pin_prefix requires tokenized prompt_token_ids")
+        if request.prompt_embeds is not None or request.prompt_is_token_ids is not None:
+            raise ValueError("pin_prefix does not support prompt embeds")
+        if request.mm_features:
+            raise ValueError("pin_prefix does not support multimodal inputs")
+        pinned_tokens = len(request.prompt_token_ids) // self.block_size * self.block_size
+        if pinned_tokens <= 0:
+            raise ValueError(
+                "pin_prefix prompt is shorter than one scheduler block "
+                f"({self.block_size} tokens)"
+            )
+
+        request.prompt_token_ids = request.prompt_token_ids[:pinned_tokens]
+        request.num_prompt_tokens = pinned_tokens
+        del request._all_token_ids[pinned_tokens:]
+        request.block_hashes = []
+        request.update_block_hashes()
+        request.pin_prefix_id = pin_id
+
+        future: Future[dict[str, Any]] = Future()
+        self._pin_prefix_futures[pin_id] = future
+        self._pin_prefix_request_ids[pin_id] = request.request_id
+        try:
+            self.add_request(request)
+        except Exception:
+            self._pin_prefix_futures.pop(pin_id, None)
+            self._pin_prefix_request_ids.pop(pin_id, None)
+            raise
+        return future
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        if pin_id in self._pin_prefix_futures:
+            request_id = self._pin_prefix_request_ids.get(pin_id)
+            if request_id is not None:
+                self.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+            return False
+        return self.kv_cache_manager.unpin_prefix(pin_id)
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:
@@ -2084,6 +2158,16 @@ class Scheduler(SchedulerInterface):
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
+            if request.pin_prefix_id is not None:
+                future = self._pin_prefix_futures.pop(request.pin_prefix_id, None)
+                self._pin_prefix_request_ids.pop(request.pin_prefix_id, None)
+                if future is not None and not future.done():
+                    future.set_exception(
+                        RuntimeError(
+                            f"prefix pin request was finished before completion: "
+                            f"{request.pin_prefix_id!r}"
+                        )
+                    )
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
                     request.request_id not in self.finished_recving_kv_req_ids
@@ -2114,6 +2198,35 @@ class Scheduler(SchedulerInterface):
             self._free_blocks(request)
 
         return kv_xfer_params
+
+    def _complete_pin_prefix_request(self, request: Request) -> None:
+        pin_id = request.pin_prefix_id
+        assert pin_id is not None
+        future = self._pin_prefix_futures.pop(pin_id, None)
+        self._pin_prefix_request_ids.pop(pin_id, None)
+
+        try:
+            self.kv_cache_manager.cache_blocks(request, request.num_prompt_tokens)
+            block_ids = self.kv_cache_manager.pin_request_blocks(pin_id, request)
+            result = {
+                "pin_id": pin_id,
+                "pinned_tokens": request.num_prompt_tokens,
+                "block_ids": block_ids,
+            }
+            request.status = RequestStatus.FINISHED_STOPPED
+            self._inflight_prefills.discard(request)
+            self.encoder_cache_manager.free(request)
+            self.finished_req_ids.add(request.request_id)
+            if self.finished_req_ids_dict is not None:
+                self.finished_req_ids_dict[request.client_index].add(request.request_id)
+            del self.requests[request.request_id]
+            if future is not None and not future.done():
+                future.set_result(result)
+        except Exception as exc:
+            if future is not None and not future.done():
+                future.set_exception(exc)
+            request.status = RequestStatus.FINISHED_ERROR
+            self._free_request(request)
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
@@ -2203,6 +2316,11 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self._pin_prefix_futures:
+            logger.warning(
+                "Failed to reset prefix cache because prefix pins are pending"
+            )
+            return False
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()

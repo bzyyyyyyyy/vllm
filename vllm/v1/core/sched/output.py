@@ -226,6 +226,14 @@ class SchedulerOutput:
     # need to perform grammar bitmask computation.
     pending_structured_output_tokens: bool = False
 
+    # Request IDs that should complete after this prefill without producing
+    # sampled tokens. Used by internal prefix-pinning requests.
+    prefill_only_req_ids: set[str] | None = None
+
+    # True when every scheduled request in this step is prefill-only, so the
+    # worker can skip the sampler path entirely after the forward pass.
+    skip_sampler: bool = False
+
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
 

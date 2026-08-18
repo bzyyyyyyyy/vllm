@@ -473,6 +473,18 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def pin_request_blocks(self, pin_id: str, request: Request) -> tuple[list[int], ...]:
+        return self.coordinator.pin_request_blocks(pin_id, request.request_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        return self.coordinator.unpin_prefix(pin_id)
+
+    def has_pinned_prefixes(self) -> bool:
+        return self.coordinator.has_pinned_prefixes()
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return self.coordinator.has_pinned_prefix(pin_id)
+
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -522,6 +534,11 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        if self.has_pinned_prefixes():
+            logger.warning(
+                "Failed to reset prefix cache because pinned prefixes are present"
+            )
+            return False
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:

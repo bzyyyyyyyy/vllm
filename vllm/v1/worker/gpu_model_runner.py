@@ -2056,6 +2056,11 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
+        if scheduler_output.prefill_only_req_ids:
+            for req_id in scheduler_output.prefill_only_req_ids:
+                req_idx = self.input_batch.req_id_to_index.get(req_id)
+                if req_idx is not None:
+                    self.discard_request_mask.np[req_idx] = True
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
@@ -4481,6 +4486,36 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if scheduler_output.skip_sampler:
+            self._draft_token_ids = None
+            self._draft_probs = None
+            self._draft_prob_req_ids = None
+            self._draft_token_req_ids = None
+            self.valid_sampled_token_count_gpu = None
+            self.input_batch.prev_sampled_token_ids = None
+
+            if self.speculative_config is not None:
+                self.finalize_kv_connector()
+
+            with record_function_or_nullcontext("gpu_model_runner: eplb"):
+                self.eplb_step()
+
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
+            req_ids_output_copy = self.input_batch.req_ids.copy()
+            return ModelRunnerOutput(
+                req_ids=req_ids_output_copy,
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[[] for _ in req_ids_output_copy],
+                prompt_logprobs_dict={},
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output
+                if self.supports_mm_inputs
+                else None,
+                cudagraph_stats=cudagraph_stats,
+                routed_experts=None,
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:

@@ -4,6 +4,7 @@ import asyncio
 import os
 import socket
 import time
+import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
@@ -277,6 +278,113 @@ class AsyncLLM(EngineClient):
 
         return self._supported_tasks
 
+    async def _process_inputs_to_core_request(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType | EngineInput,
+        params: SamplingParams | PoolingParams,
+        *,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        copy_engine_core_request: bool = False,
+        override_engine_core_request_id: bool = False,
+    ) -> tuple[EngineCoreRequest, str | None]:
+        """Convert public inputs to EngineCoreRequest.
+
+        Keep generate/add_request and internal pin-prefix requests on the same
+        frontend input-processing path for non-EngineCoreRequest prompts.
+        """
+        prompt_text = None
+        if isinstance(prompt, EngineCoreRequest):
+            logger.warning_once(
+                "Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() "
+                "is deprecated and will be removed in v0.18. You should instead pass "
+                "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
+            )
+
+            request = copy(prompt) if copy_engine_core_request else prompt
+            if override_engine_core_request_id:
+                request.request_id = request_id
+            elif request_id != request.request_id:
+                logger.warning_once(
+                    "AsyncLLM.add_request() was passed a request_id parameter that "
+                    "does not match the EngineCoreRequest.request_id attribute. The "
+                    "latter will be used, and the former will be ignored."
+                )
+        else:
+            request = self.input_processor.process_inputs(
+                request_id,
+                prompt,
+                params,
+                supported_tasks=await self.get_supported_tasks(),
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+            )
+            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+        return request, prompt_text
+
+    async def pin_prefix(
+        self,
+        prompt: EngineCoreRequest | PromptType | EngineInput,
+        pin_id: str,
+        *,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+    ) -> dict[str, Any]:
+        """Prefill a prompt prefix and pin its block-aligned KV blocks.
+
+        The prompt accepts the same input forms as generate(). The scheduler
+        pins only the block-aligned prefix and ignores any tail tokens that do
+        not fill a scheduler block.
+        """
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+
+        sampling_params = SamplingParams(
+            max_tokens=1,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+        request_id = f"pin_prefix:{pin_id}:{uuid.uuid4().hex}"
+
+        request, _ = await self._process_inputs_to_core_request(
+            request_id,
+            prompt,
+            sampling_params,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            copy_engine_core_request=True,
+            override_engine_core_request_id=True,
+        )
+        request.sampling_params = sampling_params
+        request.pooling_params = None
+        request.pin_prefix_id = pin_id
+
+        self.input_processor.assign_request_id(request)
+        return await self.engine_core.call_utility_async("pin_prefix", pin_id, request)
+
+    async def unpin_prefix(self, pin_id: str) -> bool:
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        return await self.engine_core.call_utility_async("unpin_prefix", pin_id)
+
     async def add_request(
         self,
         request_id: str,
@@ -331,34 +439,19 @@ class AsyncLLM(EngineClient):
             )
 
         # Convert Input --> Request.
-        if isinstance(prompt, EngineCoreRequest):
-            logger.warning_once(
-                "Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() "
-                "is deprecated and will be removed in v0.18. You should instead pass "
-                "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
-            )
-
-            request = prompt
-            if request_id != request.request_id:
-                logger.warning_once(
-                    "AsyncLLM.add_request() was passed a request_id parameter that "
-                    "does not match the EngineCoreRequest.request_id attribute. The "
-                    "latter will be used, and the former will be ignored."
-                )
-        else:
-            request = self.input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                supported_tasks=await self.get_supported_tasks(),
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-            )
-            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+        request, processed_prompt_text = await self._process_inputs_to_core_request(
+            request_id,
+            prompt,
+            params,
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+        )
+        if processed_prompt_text is not None:
+            prompt_text = processed_prompt_text
 
         if reasoning_ended is not None:
             request.reasoning_ended = reasoning_ended

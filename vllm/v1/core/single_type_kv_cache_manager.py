@@ -85,6 +85,7 @@ class SingleTypeKVCacheManager(ABC):
         # This is only used to track the RUNNING requests, we do not track the
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
+        self.pin_id_to_blocks: dict[str, list[KVCacheBlock]] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -398,6 +399,33 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         return req_blocks
+
+    def pin_request_blocks(self, pin_id: str, request_id: str) -> list[int]:
+        """Transfer a request's KV block ownership to a pinned prefix ID.
+
+        The request already owns one reference to these blocks from normal
+        allocation or prefix-cache touch. Transferring the bookkeeping preserves
+        that reference and lets unpin_prefix release it through the normal block
+        pool free path.
+        """
+        if pin_id in self.pin_id_to_blocks:
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        blocks = self.pop_blocks_for_free(request_id)
+        self.pin_id_to_blocks[pin_id] = blocks
+        return [block.block_id for block in blocks if not block.is_null]
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        blocks = self.pin_id_to_blocks.pop(pin_id, None)
+        if blocks is None:
+            return False
+        self.block_pool.free_blocks(reversed(blocks))
+        return True
+
+    def has_pinned_prefixes(self) -> bool:
+        return bool(self.pin_id_to_blocks)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return pin_id in self.pin_id_to_blocks
 
     def free(self, request_id: str) -> None:
         """

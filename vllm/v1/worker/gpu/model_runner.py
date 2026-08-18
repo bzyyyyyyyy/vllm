@@ -914,6 +914,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        prefill_only_mask = None
+        if scheduler_output.prefill_only_req_ids:
+            prefill_only_mask_np = np.fromiter(
+                (
+                    req_id in scheduler_output.prefill_only_req_ids
+                    for req_id in req_ids
+                ),
+                dtype=np.bool_,
+                count=num_reqs,
+            )
+            prefill_only_mask = async_copy_to_gpu(
+                prefill_only_mask_np, device=self.device
+            )
 
         # Get prefill tokens if any.
         if np.any(is_prefilling_np):
@@ -1007,6 +1020,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
+            prefill_only_mask=prefill_only_mask,
             max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
@@ -1369,6 +1383,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         self.execute_model_state = None
+
+        if scheduler_output.skip_sampler:
+            self.postprocess_num_computed_tokens(input_batch)
+            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            return ModelRunnerOutput(
+                req_ids=input_batch.req_ids,
+                req_id_to_index={
+                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
+                },
+                sampled_token_ids=[[] for _ in input_batch.req_ids],
+                prompt_logprobs_dict={},
+                kv_connector_output=kv_connector_output,
+            )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced

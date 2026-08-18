@@ -136,6 +136,12 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # Internal prefix pinning request. Such requests are scheduled through the
+    # normal prefill path, but do not produce user-visible outputs. When the
+    # block-aligned prompt prefix has been computed, its KV blocks are retained
+    # under this pin ID until explicitly unpinned.
+    pin_prefix_id: str | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

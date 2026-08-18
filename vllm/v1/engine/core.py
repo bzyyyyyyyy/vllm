@@ -414,6 +414,24 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def pin_prefix(self, pin_id: str, request: EngineCoreRequest) -> Future:
+        """Schedule an internal prefill-only request and pin its prefix KV."""
+        if request.pin_prefix_id is not None and request.pin_prefix_id != pin_id:
+            raise ValueError(
+                "EngineCoreRequest.pin_prefix_id does not match pin_id: "
+                f"{request.pin_prefix_id!r} != {pin_id!r}"
+            )
+        request.pin_prefix_id = pin_id
+        req, request_wave = self.preprocess_add_request(request)
+        if request_wave:
+            raise NotImplementedError("pin_prefix does not support DP waves")
+        pin_prefix = getattr(self.scheduler, "pin_prefix")
+        return pin_prefix(pin_id, req)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        unpin_prefix = getattr(self.scheduler, "unpin_prefix")
+        return unpin_prefix(pin_id)
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""

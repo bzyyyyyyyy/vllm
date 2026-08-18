@@ -77,6 +77,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        pin_prefix_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -194,6 +195,10 @@ class Request:
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
 
+        # Internal prefix pinning request ID. Non-None means this request should
+        # run prefill only and transfer its KV block ownership to the pin ID.
+        self.pin_prefix_id = pin_prefix_id
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -219,6 +224,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            pin_prefix_id=request.pin_prefix_id,
         )
 
     def append_output_token_ids(

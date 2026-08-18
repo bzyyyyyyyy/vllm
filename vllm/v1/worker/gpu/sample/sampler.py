@@ -129,6 +129,17 @@ class Sampler:
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
         )
+        if input_batch.prefill_only_mask is not None:
+            num_sampled = torch.where(
+                input_batch.prefill_only_mask,
+                torch.zeros_like(num_sampled),
+                num_sampled,
+            )
+            num_rejected = torch.where(
+                input_batch.prefill_only_mask,
+                torch.zeros_like(num_rejected),
+                num_rejected,
+            )
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(
