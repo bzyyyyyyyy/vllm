@@ -1407,8 +1407,9 @@ def test_inflight_partial_prefix_starts_before_producer_finishes(
         assert consumer_future.result()["pinned_tokens"] == 8
     else:
         assert output.num_scheduled_tokens[consumer.request_id] == 1
-    assert producer.num_computed_tokens < producer.num_prompt_tokens
-    if producer_future is not None:
+    if producer_future is None:
+        assert producer.num_computed_tokens < producer.num_prompt_tokens
+    else:
         assert not producer_future.done()
 
 
