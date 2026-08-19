@@ -1488,6 +1488,77 @@ def test_unpin_prefix_aborts_pending_request():
         future.result()
 
 
+def test_cpu_pin_requires_compatible_connector():
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=4)
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        block_size=4,
+        req_ids=["cpu-pin-request"],
+    )
+    pin_request.pin_prefix_level = "cpu"
+
+    with pytest.raises(RuntimeError, match="compatible KV offload connector"):
+        scheduler.pin_prefix("cpu-pin", pin_request)
+
+
+def test_cpu_pin_waits_for_connector_and_releases_gpu_blocks():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    connector = Mock()
+    connector.has_pinned_prefix.return_value = False
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.get_num_new_matched_tokens.return_value = (0, False)
+    connector.build_connector_meta.return_value = None
+    connector.request_finished.return_value = (False, None)
+    connector.is_prefix_pin_ready.return_value = False
+    connector.get_prefix_pin_block_ids.return_value = [10, 11]
+    connector.get_kv_connector_stats.return_value = None
+    scheduler.connector = connector
+
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        block_size=4,
+        req_ids=["cpu-pin-request"],
+    )
+    pin_request.pin_prefix_level = "cpu"
+    future = scheduler.pin_prefix("cpu-pin", pin_request)
+
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[]])
+
+    assert not future.done()
+    assert scheduler.kv_cache_manager.has_pinned_prefix("cpu-pin")
+
+    connector.is_prefix_pin_ready.return_value = True
+    scheduler._try_complete_cpu_prefix_pin("cpu-pin")
+
+    assert future.result() == {
+        "pin_id": "cpu-pin",
+        "level": "cpu",
+        "pinned_tokens": 8,
+        "block_ids": [10, 11],
+    }
+    assert not scheduler.kv_cache_manager.has_pinned_prefix("cpu-pin")
+    connector.pin_prefix.assert_called_once_with("cpu-pin", pin_request)
+
+
+def test_prefix_cache_reset_preflights_cpu_pins():
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=4)
+    connector = Mock()
+    connector.has_pinned_prefixes.return_value = True
+    scheduler.connector = connector
+    scheduler.kv_cache_manager.reset_prefix_cache = Mock(return_value=True)
+
+    assert not scheduler.reset_prefix_cache(reset_connector=True)
+    scheduler.kv_cache_manager.reset_prefix_cache.assert_not_called()
+    connector.reset_cache.assert_not_called()
+
+
 def test_spec_decode_padding_first_decode_step():
     """A request taking its first decode step (whole prompt already computed via
     a prefix-cache hit) is padded with placeholder (-1) spec tokens so it enters

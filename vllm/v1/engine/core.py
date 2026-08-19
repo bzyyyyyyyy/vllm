@@ -422,6 +422,10 @@ class EngineCore:
                 f"{request.pin_prefix_id!r} != {pin_id!r}"
             )
         request.pin_prefix_id = pin_id
+        if request.pin_prefix_level not in ("gpu", "cpu"):
+            raise ValueError(
+                f"unsupported prefix pin level: {request.pin_prefix_level!r}"
+            )
         req, request_wave = self.preprocess_add_request(request)
         if request_wave:
             raise NotImplementedError("pin_prefix does not support DP waves")

@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable
 from concurrent.futures import Future
 from dataclasses import replace
+from math import lcm
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -338,6 +339,9 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills: set[Request] = set()
         self._pin_prefix_futures: dict[str, Future[dict[str, Any]]] = {}
         self._pin_prefix_request_ids: dict[str, str] = {}
+        self._pin_prefix_levels: dict[str, str] = {}
+        self._pin_prefix_tokens: dict[str, int] = {}
+        self._cpu_pin_waiting: set[str] = set()
         self._inflight_prefixes = InFlightPrefixTracker(self.block_size)
         self._prefix_reservations: dict[str, list[KVCacheBlock]] = {}
 
@@ -2199,17 +2203,37 @@ class Scheduler(SchedulerInterface):
             raise ValueError(f"prefix pin already exists or is pending: {pin_id!r}")
         if self.kv_cache_manager.has_pinned_prefix(pin_id):
             raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        if request.pin_prefix_level not in ("gpu", "cpu"):
+            raise ValueError(
+                f"unsupported prefix pin level: {request.pin_prefix_level!r}"
+            )
+        if self.connector is not None and self.connector.has_pinned_prefix(pin_id):
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
         if request.prompt_token_ids is None:
             raise ValueError("pin_prefix requires tokenized prompt_token_ids")
         if request.prompt_embeds is not None or request.prompt_is_token_ids is not None:
             raise ValueError("pin_prefix does not support prompt embeds")
         if request.mm_features:
             raise ValueError("pin_prefix does not support multimodal inputs")
-        pinned_tokens = len(request.prompt_token_ids) // self.block_size * self.block_size
+        alignment = self.block_size
+        if request.pin_prefix_level == "cpu":
+            if self.connector is None:
+                raise RuntimeError(
+                    "CPU prefix pinning requires a compatible KV offload connector"
+                )
+            connector_alignment = self.connector.get_prefix_pin_alignment()
+            if connector_alignment is None:
+                raise RuntimeError(
+                    f"{type(self.connector).__name__} does not support "
+                    "CPU prefix pinning"
+                )
+            alignment = lcm(self.block_size, connector_alignment)
+
+        pinned_tokens = len(request.prompt_token_ids) // alignment * alignment
         if pinned_tokens <= 0:
             raise ValueError(
                 "pin_prefix prompt is shorter than one scheduler block "
-                f"({self.block_size} tokens)"
+                f"({alignment} tokens)"
             )
 
         request.prompt_token_ids = request.prompt_token_ids[:pinned_tokens]
@@ -2218,25 +2242,59 @@ class Scheduler(SchedulerInterface):
         request.block_hashes = []
         request.update_block_hashes()
         request.pin_prefix_id = pin_id
+        if request.pin_prefix_level == "cpu":
+            # Reserved CPU blocks are initially HIT_PENDING. This internal
+            # producer request must compute them rather than wait on itself.
+            request.skip_reading_prefix_cache = True
 
         future: Future[dict[str, Any]] = Future()
         self._pin_prefix_futures[pin_id] = future
         self._pin_prefix_request_ids[pin_id] = request.request_id
+        self._pin_prefix_levels[pin_id] = request.pin_prefix_level
+        self._pin_prefix_tokens[pin_id] = pinned_tokens
         try:
             self.add_request(request)
+            if request.pin_prefix_level == "cpu":
+                assert self.connector is not None
+                self.connector.pin_prefix(pin_id, request)
         except Exception:
             self._pin_prefix_futures.pop(pin_id, None)
             self._pin_prefix_request_ids.pop(pin_id, None)
+            self._pin_prefix_levels.pop(pin_id, None)
+            self._pin_prefix_tokens.pop(pin_id, None)
+            if self.connector is not None:
+                self.connector.unpin_prefix(pin_id)
+            if request.request_id in self.requests:
+                self.finish_requests(
+                    request.request_id, RequestStatus.FINISHED_ERROR
+                )
             raise
         return future
 
     def unpin_prefix(self, pin_id: str) -> bool:
         if pin_id in self._pin_prefix_futures:
             request_id = self._pin_prefix_request_ids.get(pin_id)
-            if request_id is not None:
+            level = self._pin_prefix_levels.get(pin_id, "gpu")
+            if level == "cpu" and self.connector is not None:
+                self.connector.unpin_prefix(pin_id)
+                self.kv_cache_manager.unpin_prefix(pin_id)
+                self._cpu_pin_waiting.discard(pin_id)
+            if request_id is not None and request_id in self.requests:
                 self.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+            else:
+                future = self._pin_prefix_futures.pop(pin_id, None)
+                self._pin_prefix_request_ids.pop(pin_id, None)
+                self._pin_prefix_levels.pop(pin_id, None)
+                self._pin_prefix_tokens.pop(pin_id, None)
+                if future is not None and not future.done():
+                    future.set_exception(
+                        RuntimeError(f"prefix pin was cancelled: {pin_id!r}")
+                    )
             return False
-        return self.kv_cache_manager.unpin_prefix(pin_id)
+        unpinned = self.kv_cache_manager.unpin_prefix(pin_id)
+        if self.connector is not None:
+            unpinned = self.connector.unpin_prefix(pin_id) or unpinned
+        return unpinned
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2293,6 +2351,12 @@ class Scheduler(SchedulerInterface):
             if request.pin_prefix_id is not None:
                 future = self._pin_prefix_futures.pop(request.pin_prefix_id, None)
                 self._pin_prefix_request_ids.pop(request.pin_prefix_id, None)
+                level = self._pin_prefix_levels.pop(request.pin_prefix_id, "gpu")
+                self._pin_prefix_tokens.pop(request.pin_prefix_id, None)
+                self._cpu_pin_waiting.discard(request.pin_prefix_id)
+                if level == "cpu" and self.connector is not None:
+                    self.connector.unpin_prefix(request.pin_prefix_id)
+                    self.kv_cache_manager.unpin_prefix(request.pin_prefix_id)
                 if future is not None and not future.done():
                     future.set_exception(
                         RuntimeError(
@@ -2335,17 +2399,15 @@ class Scheduler(SchedulerInterface):
     def _complete_pin_prefix_request(self, request: Request) -> None:
         pin_id = request.pin_prefix_id
         assert pin_id is not None
-        future = self._pin_prefix_futures.pop(pin_id, None)
-        self._pin_prefix_request_ids.pop(pin_id, None)
+        level = self._pin_prefix_levels.get(pin_id, "gpu")
+        future = self._pin_prefix_futures.get(pin_id)
 
         try:
             self.kv_cache_manager.cache_blocks(request, request.num_prompt_tokens)
+            if level == "cpu":
+                request.status = RequestStatus.FINISHED_STOPPED
+                self._connector_finished(request)
             block_ids = self.kv_cache_manager.pin_request_blocks(pin_id, request)
-            result = {
-                "pin_id": pin_id,
-                "pinned_tokens": request.num_prompt_tokens,
-                "block_ids": block_ids,
-            }
             request.status = RequestStatus.FINISHED_STOPPED
             self._inflight_prefills.discard(request)
             self.encoder_cache_manager.free(request)
@@ -2354,13 +2416,59 @@ class Scheduler(SchedulerInterface):
                 self.finished_req_ids_dict[request.client_index].add(request.request_id)
             self._remove_inflight_prefix_request(request.request_id)
             del self.requests[request.request_id]
-            if future is not None and not future.done():
-                future.set_result(result)
+            if level == "cpu":
+                self._cpu_pin_waiting.add(pin_id)
+                self._try_complete_cpu_prefix_pin(pin_id)
+            else:
+                self._pin_prefix_futures.pop(pin_id, None)
+                self._pin_prefix_request_ids.pop(pin_id, None)
+                self._pin_prefix_levels.pop(pin_id, None)
+                self._pin_prefix_tokens.pop(pin_id, None)
+                result = {
+                    "pin_id": pin_id,
+                    "level": "gpu",
+                    "pinned_tokens": request.num_prompt_tokens,
+                    "block_ids": block_ids,
+                }
+                if future is not None and not future.done():
+                    future.set_result(result)
         except Exception as exc:
+            self._pin_prefix_futures.pop(pin_id, None)
+            self._pin_prefix_request_ids.pop(pin_id, None)
+            self._pin_prefix_levels.pop(pin_id, None)
+            self._pin_prefix_tokens.pop(pin_id, None)
+            self._cpu_pin_waiting.discard(pin_id)
+            if level == "cpu" and self.connector is not None:
+                self.connector.unpin_prefix(pin_id)
+                self.kv_cache_manager.unpin_prefix(pin_id)
             if future is not None and not future.done():
                 future.set_exception(exc)
             request.status = RequestStatus.FINISHED_ERROR
-            self._free_request(request)
+            if request.request_id in self.requests:
+                self._free_request(request)
+
+    def _try_complete_cpu_prefix_pin(self, pin_id: str) -> None:
+        if pin_id not in self._cpu_pin_waiting or self.connector is None:
+            return
+        if not self.connector.is_prefix_pin_ready(pin_id):
+            return
+
+        block_ids = self.connector.get_prefix_pin_block_ids(pin_id)
+        self.kv_cache_manager.unpin_prefix(pin_id)
+        self._cpu_pin_waiting.remove(pin_id)
+        pinned_tokens = self._pin_prefix_tokens.pop(pin_id)
+        future = self._pin_prefix_futures.pop(pin_id, None)
+        self._pin_prefix_request_ids.pop(pin_id, None)
+        self._pin_prefix_levels.pop(pin_id, None)
+        if future is not None and not future.done():
+            future.set_result(
+                {
+                    "pin_id": pin_id,
+                    "level": "cpu",
+                    "pinned_tokens": pinned_tokens,
+                    "block_ids": block_ids,
+                }
+            )
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
@@ -2453,6 +2561,15 @@ class Scheduler(SchedulerInterface):
         if self._pin_prefix_futures:
             logger.warning(
                 "Failed to reset prefix cache because prefix pins are pending"
+            )
+            return False
+        if (
+            reset_connector
+            and self.connector is not None
+            and self.connector.has_pinned_prefixes()
+        ):
+            logger.warning(
+                "Failed to reset prefix cache because CPU prefix pins are present"
             )
             return False
         if self._inflight_prefixes.has_state() and not reset_running_requests:
@@ -2753,6 +2870,8 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+            for pin_id in tuple(self._cpu_pin_waiting):
+                self._try_complete_cpu_prefix_pin(pin_id)
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

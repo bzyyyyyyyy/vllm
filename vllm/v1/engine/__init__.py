@@ -25,6 +25,9 @@ from vllm.v1.serial_utils import UtilityResult
 # - "keep": Freeze requests in queue; they resume on resume_generation().
 PauseMode = Literal["abort", "wait", "keep"]
 
+# Physical residency guaranteed by pin_prefix().
+PrefixPinLevel = Literal["gpu", "cpu"]
+
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
 FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
@@ -141,6 +144,7 @@ class EngineCoreRequest(
     # block-aligned prompt prefix has been computed, its KV blocks are retained
     # under this pin ID until explicitly unpinned.
     pin_prefix_id: str | None = None
+    pin_prefix_level: PrefixPinLevel = "gpu"
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

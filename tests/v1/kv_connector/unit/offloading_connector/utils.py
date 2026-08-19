@@ -134,6 +134,8 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
         self.manager.on_new_request.return_value = RequestOffloadingContext()
+        self.manager.has_pinned_prefix.return_value = False
+        self.manager.has_pinned_prefixes.return_value = False
         self.handler = MockOffloadingWorker()
 
     def get_manager(self) -> OffloadingManager:

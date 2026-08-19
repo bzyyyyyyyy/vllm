@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
+from math import lcm
 from typing import Any, NamedTuple
 
 from vllm.distributed.kv_events import KVCacheEvent
@@ -635,6 +636,8 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
+        if request.request_id in self._req_status:
+            return
         req_context = _create_req_context(request)
         offloading_context = self.manager.on_new_request(req_context)
         req_status = RequestOffloadState(
@@ -644,6 +647,58 @@ class OffloadingConnectorScheduler:
             offloading_context=offloading_context,
         )
         self._req_status[request.request_id] = req_status
+
+    def get_prefix_pin_alignment(self) -> int:
+        return lcm(
+            *(config.offloaded_block_size for config in self.config.kv_group_configs)
+        )
+
+    def _get_prefix_pin_keys(
+        self, req_status: RequestOffloadState
+    ) -> list[OffloadKey]:
+        req_status.update_offload_keys()
+        num_tokens = req_status.req.num_prompt_tokens
+        keys: list[OffloadKey] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            num_blocks = num_tokens // group_config.offloaded_block_size
+            if group_config.is_eagle_group:
+                num_blocks = max(0, num_blocks - 1)
+            tail = group_config.sliding_window_size_in_blocks
+            for block_idx, key in enumerate(group_state.offload_keys[:num_blocks]):
+                alignment_block_count = group_config.alignment_block_count
+                if alignment_block_count is not None:
+                    assert tail is not None
+                    if block_idx % alignment_block_count < alignment_block_count - tail:
+                        continue
+                keys.append(key)
+        return keys
+
+    def pin_prefix(self, pin_id: str, request: Request) -> list[int]:
+        self.on_new_request(request)
+        req_status = self._req_status[request.request_id]
+        req_status.max_offload_tokens = None
+        return self.manager.pin_prefix(
+            pin_id,
+            self._get_prefix_pin_keys(req_status),
+            req_status.req_context,
+        )
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        return self.manager.is_prefix_pin_ready(pin_id)
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        return self.manager.get_prefix_pin_block_ids(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        return self.manager.unpin_prefix(pin_id)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return self.manager.has_pinned_prefix(pin_id)
+
+    def has_pinned_prefixes(self) -> bool:
+        return self.manager.has_pinned_prefixes()
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -1228,8 +1283,13 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
-    def reset_cache(self) -> None:
+    def reset_cache(self) -> bool:
         """Reset the offloading manager cache, evicting all stored blocks."""
+        if self.manager.has_pinned_prefixes():
+            logger.warning(
+                "Cannot reset offloaded KV cache while CPU prefix pins are present"
+            )
+            return False
 
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
@@ -1264,6 +1324,7 @@ class OffloadingConnectorScheduler:
         # The load flush IDs collected above must be delivered to workers.
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.clear()
+        return True
 
     def shutdown(self) -> None:
         self.manager.shutdown()

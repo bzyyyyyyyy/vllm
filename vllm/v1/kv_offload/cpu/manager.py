@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Collection, Iterable
 from typing import Literal
 
@@ -74,6 +74,13 @@ class CPUOffloadingManager(OffloadingManager):
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
         )
+
+        # Hard prefix pins are separate from transient transfer references.
+        # Pending blocks keep ref_cnt == -1, so their future pin references are
+        # tracked here and installed when the store completes.
+        self._pin_id_to_keys: dict[str, tuple[OffloadKey, ...]] = {}
+        self._pin_ref_counts: Counter[OffloadKey] = Counter()
+        self._reserved_store_keys: set[OffloadKey] = set()
 
     # --- block pool ---
 
@@ -171,12 +178,22 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        unique_keys = list(dict.fromkeys(keys))
+        reserved_keys = self._reserved_store_keys.intersection(unique_keys)
+        regular_keys = [key for key in unique_keys if key not in reserved_keys]
         if self.counts is not None:
-            num_keys = len(keys)
-            keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
-            self.stores_skipped_in_current_batch += num_keys - len(keys)
-        # filter out blocks that are already stored
-        keys_to_store = [k for k in keys if self._policy.get(k) is None]
+            num_keys = len(regular_keys)
+            regular_keys = [
+                k for k in regular_keys if self.counts.get(k, 0) >= self.store_threshold
+            ]
+            self.stores_skipped_in_current_batch += num_keys - len(regular_keys)
+
+        regular_keys = [key for key in regular_keys if self._policy.get(key) is None]
+        keys_to_store = [
+            key
+            for key in unique_keys
+            if key in reserved_keys or key in regular_keys
+        ]
 
         if not keys_to_store:
             return PrepareStoreOutput(
@@ -185,7 +202,7 @@ class CPUOffloadingManager(OffloadingManager):
                 evicted_keys=[],
             )
 
-        num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
+        num_blocks_to_evict = len(regular_keys) - self._get_num_free_blocks()
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
@@ -197,7 +214,7 @@ class CPUOffloadingManager(OffloadingManager):
 
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
-            protected = set(keys)
+            protected = set(unique_keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
                 return None
@@ -219,16 +236,22 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
-        blocks = self._allocate_blocks(keys_to_store)
-        assert len(blocks) == len(keys_to_store), (
+        new_blocks = self._allocate_blocks(regular_keys)
+        assert len(new_blocks) == len(regular_keys), (
             "Block pool did not allocate the expected number of blocks"
         )
 
-        for key, block in zip(keys_to_store, blocks):
+        for key, block in zip(regular_keys, new_blocks):
             self._policy.insert(key, block)
 
+        blocks = [self._policy.get(key) for key in keys_to_store]
+        assert all(block is not None for block in blocks)
+        pending_blocks = [block for block in blocks if block is not None]
+        assert all(not block.is_ready for block in pending_blocks)
+        self._reserved_store_keys.difference_update(keys_to_store)
+
         # build store specs for allocated blocks
-        store_spec = self._get_load_store_spec(keys_to_store, blocks)
+        store_spec = self._get_load_store_spec(keys_to_store, pending_blocks)
 
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
@@ -249,9 +272,10 @@ class CPUOffloadingManager(OffloadingManager):
             for key in keys:
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:
-                    block.ref_cnt = 0
-                    self._num_evictable_cache_blocks += 1
-                    self._policy.mark_evictable(key)
+                    block.ref_cnt = self._pin_ref_counts.get(key, 0)
+                    if block.ref_cnt == 0:
+                        self._num_evictable_cache_blocks += 1
+                        self._policy.mark_evictable(key)
                     stored_keys.append(key)
         else:
             for key in keys:
@@ -270,7 +294,117 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
     @override
+    def pin_prefix(
+        self,
+        pin_id: str,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> list[int]:
+        if pin_id in self._pin_id_to_keys:
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+
+        unique_keys = tuple(dict.fromkeys(keys))
+        if not unique_keys:
+            raise ValueError("CPU prefix pin contains no offloadable blocks")
+
+        missing_keys = [key for key in unique_keys if self._policy.get(key) is None]
+        num_blocks_to_evict = len(missing_keys) - self._get_num_free_blocks()
+        to_evict: list[OffloadKey] = []
+        if num_blocks_to_evict > 0:
+            if num_blocks_to_evict > self._num_evictable_cache_blocks:
+                raise RuntimeError(
+                    "insufficient CPU KV cache capacity for hard prefix pin"
+                )
+            evicted = self._policy.evict(num_blocks_to_evict, set(unique_keys))
+            if evicted is None:
+                raise RuntimeError(
+                    "insufficient CPU KV cache capacity for hard prefix pin"
+                )
+            self._num_evictable_cache_blocks -= len(evicted)
+            for key, block in evicted:
+                self._free_block(block)
+                to_evict.append(key)
+
+        new_blocks = self._allocate_blocks(missing_keys)
+        for key, block in zip(missing_keys, new_blocks):
+            self._policy.insert(key, block)
+        self._reserved_store_keys.update(missing_keys)
+
+        self._pin_id_to_keys[pin_id] = unique_keys
+        for key in unique_keys:
+            block = self._policy.get(key)
+            assert block is not None
+            self._pin_ref_counts[key] += 1
+            if block.is_ready:
+                if block.ref_cnt == 0:
+                    self._policy.mark_non_evictable(key)
+                    self._num_evictable_cache_blocks -= 1
+                block.ref_cnt += 1
+
+        if to_evict and self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=to_evict, medium=self.medium, removed=True)
+            )
+
+        return self.get_prefix_pin_block_ids(pin_id)
+
+    @override
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        keys = self._pin_id_to_keys.get(pin_id)
+        return keys is not None and all(
+            (block := self._policy.get(key)) is not None and block.is_ready
+            for key in keys
+        )
+
+    @override
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        keys = self._pin_id_to_keys.get(pin_id)
+        if keys is None:
+            raise KeyError(pin_id)
+        blocks = [self._policy.get(key) for key in keys]
+        assert all(block is not None for block in blocks)
+        return [block.block_id for block in blocks if block is not None]
+
+    @override
+    def unpin_prefix(self, pin_id: str) -> bool:
+        keys = self._pin_id_to_keys.pop(pin_id, None)
+        if keys is None:
+            return False
+
+        for key in keys:
+            self._pin_ref_counts[key] -= 1
+            if self._pin_ref_counts[key] == 0:
+                del self._pin_ref_counts[key]
+
+            block = self._policy.get(key)
+            if block is None:
+                continue
+            if block.is_ready:
+                assert block.ref_cnt > 0
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    self._num_evictable_cache_blocks += 1
+                    self._policy.mark_evictable(key)
+            elif key in self._reserved_store_keys and key not in self._pin_ref_counts:
+                self._reserved_store_keys.remove(key)
+                self._policy.remove(key)
+                self._free_block(block)
+        return True
+
+    @override
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return pin_id in self._pin_id_to_keys
+
+    @override
+    def has_pinned_prefixes(self) -> bool:
+        return bool(self._pin_id_to_keys)
+
+    @override
     def reset_cache(self) -> None:
+        if self.has_pinned_prefixes():
+            raise RuntimeError(
+                "cannot reset CPU KV cache while hard prefix pins are present"
+            )
         # Clear ALL blocks unconditionally. The scheduler's _stale_job_threshold
         # guarantees that complete_load / complete_store are never called for
         # pre-reset jobs, so no lazy cleanup is needed. The scheduler also
@@ -281,6 +415,9 @@ class CPUOffloadingManager(OffloadingManager):
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
+        self._pin_id_to_keys.clear()
+        self._pin_ref_counts.clear()
+        self._reserved_store_keys.clear()
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:

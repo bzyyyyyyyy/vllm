@@ -115,6 +115,69 @@ def verify_events(
 
 
 @pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+def test_hard_prefix_pin_reserves_stores_and_protects_blocks(eviction_policy):
+    manager = make_cpu_manager(
+        num_blocks=2,
+        cache_policy=eviction_policy,
+        store_threshold=2,
+    )
+    keys = to_keys([1, 2])
+
+    assert manager.pin_prefix("pin", keys, _EMPTY_REQ_CTX) == [0, 1]
+    assert not manager.is_prefix_pin_ready("pin")
+
+    # Prefix reservations bypass the ordinary repeat-hit store threshold.
+    store_output = manager.prepare_store(keys, _EMPTY_REQ_CTX)
+    verify_store_output(
+        store_output,
+        ExpectedPrepareStoreOutput(
+            keys_to_store=[1, 2],
+            store_block_ids=[0, 1],
+            evicted_keys=[],
+        ),
+    )
+    manager.complete_store(keys, _EMPTY_REQ_CTX)
+
+    assert manager.is_prefix_pin_ready("pin")
+    assert manager.get_prefix_pin_block_ids("pin") == [0, 1]
+    with pytest.raises(RuntimeError, match="insufficient CPU KV cache capacity"):
+        manager.pin_prefix("blocked", to_keys([3]), _EMPTY_REQ_CTX)
+    with pytest.raises(RuntimeError, match="hard prefix pins"):
+        manager.reset_cache()
+
+    assert manager.unpin_prefix("pin")
+    assert not manager.has_pinned_prefixes()
+    assert manager.pin_prefix("replacement", to_keys([3]), _EMPTY_REQ_CTX)
+
+
+def test_overlapping_hard_prefix_pins_release_last_reference():
+    manager = make_cpu_manager(num_blocks=1)
+    keys = to_keys([1])
+    manager.prepare_store(keys, _EMPTY_REQ_CTX)
+    manager.complete_store(keys, _EMPTY_REQ_CTX)
+
+    manager.pin_prefix("first", keys, _EMPTY_REQ_CTX)
+    manager.pin_prefix("second", keys, _EMPTY_REQ_CTX)
+    assert manager.unpin_prefix("first")
+    assert manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX) is None
+
+    assert manager.unpin_prefix("second")
+    assert manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX) is not None
+
+
+def test_hard_prefix_pin_capacity_failure_is_atomic():
+    manager = make_cpu_manager(num_blocks=2)
+    manager.pin_prefix("first", to_keys([1, 2]), _EMPTY_REQ_CTX)
+
+    with pytest.raises(RuntimeError, match="insufficient CPU KV cache capacity"):
+        manager.pin_prefix("second", to_keys([3]), _EMPTY_REQ_CTX)
+
+    assert not manager.has_pinned_prefix("second")
+    assert manager.unpin_prefix("first")
+    assert manager.pin_prefix("second", to_keys([3]), _EMPTY_REQ_CTX) == [1]
+
+
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
 def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     """
     Regression test: a block that is already stored must not be evicted

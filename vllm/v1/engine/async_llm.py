@@ -38,7 +38,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import EngineCoreRequest, PauseMode, PrefixPinLevel
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -341,17 +341,21 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        level: PrefixPinLevel = "gpu",
     ) -> dict[str, Any]:
         """Prefill a prompt prefix and pin its block-aligned KV blocks.
 
         The prompt accepts the same input forms as generate(). The scheduler
         pins only the block-aligned prefix and ignores any tail tokens that do
-        not fill a scheduler block.
+        not fill a scheduler block. GPU pins retain device blocks; CPU pins
+        complete only after every offloaded block is resident and protected.
         """
         if self.errored:
             raise EngineDeadError()
         if not isinstance(pin_id, str):
             raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        if level not in ("gpu", "cpu"):
+            raise ValueError(f"unsupported prefix pin level: {level!r}")
 
         sampling_params = SamplingParams(
             max_tokens=1,
@@ -374,6 +378,7 @@ class AsyncLLM(EngineClient):
         request.sampling_params = sampling_params
         request.pooling_params = None
         request.pin_prefix_id = pin_id
+        request.pin_prefix_level = level
 
         self.input_processor.assign_request_id(request)
         pin_call = asyncio.create_task(

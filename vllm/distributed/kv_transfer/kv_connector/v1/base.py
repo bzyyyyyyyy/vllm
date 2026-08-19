@@ -581,6 +581,37 @@ class KVConnectorBase_V1(ABC):
         # scheduler alive (e.g. extend has_unfinished_requests).
         return False
 
+    def get_prefix_pin_alignment(self) -> int | None:
+        """Return the token alignment required for CPU prefix pinning.
+
+        ``None`` means this connector does not support CPU-resident prefix pins.
+        """
+        return None
+
+    def pin_prefix(self, pin_id: str, request: "Request") -> list[int]:
+        """Atomically reserve connector storage for a hard prefix pin."""
+        raise RuntimeError(
+            f"{type(self).__name__} does not support CPU prefix pinning"
+        )
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        """Return whether every connector block for ``pin_id`` is readable."""
+        return False
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        """Return physical connector block IDs owned by a ready prefix pin."""
+        raise KeyError(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        """Release a connector-resident hard prefix pin."""
+        return False
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return False
+
+    def has_pinned_prefixes(self) -> bool:
+        return False
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """

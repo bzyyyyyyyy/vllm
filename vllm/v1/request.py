@@ -19,6 +19,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    PrefixPinLevel,
 )
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
@@ -78,6 +79,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         pin_prefix_id: str | None = None,
+        pin_prefix_level: PrefixPinLevel = "gpu",
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -198,6 +200,7 @@ class Request:
         # Internal prefix pinning request ID. Non-None means this request should
         # run prefill only and transfer its KV block ownership to the pin ID.
         self.pin_prefix_id = pin_prefix_id
+        self.pin_prefix_level = pin_prefix_level
 
     @classmethod
     def from_engine_core_request(
@@ -225,6 +228,7 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             pin_prefix_id=request.pin_prefix_id,
+            pin_prefix_level=request.pin_prefix_level,
         )
 
     def append_output_token_ids(

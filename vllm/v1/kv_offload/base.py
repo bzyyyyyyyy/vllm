@@ -334,6 +334,32 @@ class OffloadingManager(ABC):
         """
         return False
 
+    def pin_prefix(
+        self,
+        pin_id: str,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> list[int]:
+        """Atomically reserve and hard-pin all ``keys`` in this tier."""
+        raise RuntimeError(
+            f"{type(self).__name__} does not support hard prefix pinning"
+        )
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        return False
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        raise KeyError(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        return False
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return False
+
+    def has_pinned_prefixes(self) -> bool:
+        return False
+
     def reset_cache(self) -> None:
         """Evict all tracked blocks and reset internal state."""
         return

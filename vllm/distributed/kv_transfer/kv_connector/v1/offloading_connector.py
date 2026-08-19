@@ -154,6 +154,34 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.has_pending_push_work()
 
+    def get_prefix_pin_alignment(self) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_prefix_pin_alignment()
+
+    def pin_prefix(self, pin_id: str, request: Request) -> list[int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.pin_prefix(pin_id, request)
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.is_prefix_pin_ready(pin_id)
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_prefix_pin_block_ids(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.unpin_prefix(pin_id)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.has_pinned_prefix(pin_id)
+
+    def has_pinned_prefixes(self) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.has_pinned_prefixes()
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
@@ -184,8 +212,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
     def reset_cache(self) -> bool | None:
         assert self.connector_scheduler is not None
-        self.connector_scheduler.reset_cache()
-        return True
+        return self.connector_scheduler.reset_cache()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_scheduler is not None:
