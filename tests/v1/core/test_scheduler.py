@@ -1517,6 +1517,7 @@ def test_cpu_pin_waits_for_connector_and_releases_gpu_blocks():
     connector.is_prefix_pin_ready.return_value = False
     connector.get_prefix_pin_block_ids.return_value = [10, 11]
     connector.get_kv_connector_stats.return_value = None
+    connector.take_events.return_value = []
     scheduler.connector = connector
 
     (pin_request,) = create_requests(
