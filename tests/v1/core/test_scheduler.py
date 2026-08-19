@@ -1465,6 +1465,29 @@ def test_pin_prefix_completes_from_ready_cache_without_model_step():
     assert scheduler.kv_cache_manager.has_pinned_prefix("pin")
 
 
+def test_unpin_prefix_aborts_pending_request():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        block_size=4,
+        req_ids=["pin-request"],
+    )
+
+    future = scheduler.pin_prefix("pin", pin_request)
+    output = scheduler.schedule()
+    assert pin_request.request_id in output.num_scheduled_tokens
+
+    assert not scheduler.unpin_prefix("pin")
+    assert pin_request.request_id not in scheduler.requests
+    with pytest.raises(RuntimeError, match="finished before completion"):
+        future.result()
+
+
 def test_spec_decode_padding_first_decode_step():
     """A request taking its first decode step (whole prompt already computed via
     a prefix-cache hit) is padded with placeholder (-1) spec tokens so it enters

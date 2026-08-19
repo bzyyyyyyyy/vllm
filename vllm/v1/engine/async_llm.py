@@ -376,7 +376,20 @@ class AsyncLLM(EngineClient):
         request.pin_prefix_id = pin_id
 
         self.input_processor.assign_request_id(request)
-        return await self.engine_core.call_utility_async("pin_prefix", pin_id, request)
+        pin_call = asyncio.create_task(
+            self.engine_core.call_utility_async("pin_prefix", pin_id, request)
+        )
+        try:
+            return await asyncio.shield(pin_call)
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self.engine_core.call_utility_async("unpin_prefix", pin_id)
+            )
+            try:
+                await pin_call
+            except Exception:
+                pass
+            raise
 
     async def unpin_prefix(self, pin_id: str) -> bool:
         if self.errored:
