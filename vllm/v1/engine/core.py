@@ -526,6 +526,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        execute_started_at = time.monotonic()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -536,6 +537,11 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        self._log_model_step_while_requests_paused(
+            scheduler_output,
+            execute_started_at,
+        )
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -544,6 +550,40 @@ class EngineCore:
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _log_model_step_while_requests_paused(
+        self,
+        scheduler_output: SchedulerOutput,
+        execute_started_at: float,
+    ) -> None:
+        paused_request_ids = self.scheduler.get_paused_request_ids()
+        if not paused_request_ids:
+            return
+
+        scheduled_tokens = scheduler_output.num_scheduled_tokens
+        scheduled_priorities = {
+            request_id: request.priority
+            for request_id in scheduled_tokens
+            if (request := self.scheduler.requests.get(request_id)) is not None
+        }
+        connector_metadata = scheduler_output.kv_connector_metadata
+        load_jobs = getattr(connector_metadata, "load_jobs", ())
+        store_jobs = getattr(connector_metadata, "store_jobs", ())
+        flush_jobs = getattr(connector_metadata, "jobs_to_flush", ()) or ()
+        logger.info(
+            "Model step while requests paused: paused_request_ids=%s "
+            "scheduled_tokens=%s scheduled_priorities=%s total_tokens=%d "
+            "kv_load_jobs=%d kv_store_jobs=%d kv_flush_jobs=%d "
+            "execute_ms=%.3f",
+            paused_request_ids,
+            scheduled_tokens,
+            scheduled_priorities,
+            scheduler_output.total_num_scheduled_tokens,
+            len(load_jobs),
+            len(store_jobs),
+            len(flush_jobs),
+            (time.monotonic() - execute_started_at) * 1000,
+        )
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,

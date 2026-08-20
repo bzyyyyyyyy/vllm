@@ -2716,6 +2716,8 @@ class Scheduler(SchedulerInterface):
         request_id = request.request_id
         if request_id not in self._paused_requests:
             return
+        num_computed_tokens = self._pause_num_computed_tokens.get(request_id, 0)
+        cpu_backed_tokens = self._pause_cpu_backed_tokens.get(request_id, 0)
         self._paused_requests.pop(request_id)
         request.spec_token_ids.clear()
 
@@ -2725,6 +2727,14 @@ class Scheduler(SchedulerInterface):
             self._resuming_paused_req_ids.add(request_id)
             request.status = RequestStatus.PREEMPTED
             self.waiting.prepend_request(request)
+            logger.info(
+                "Resumed CPU-backed request: request_id=%s computed_tokens=%d "
+                "cpu_backed_tokens=%d gpu_tail_tokens=%d",
+                request_id,
+                num_computed_tokens,
+                cpu_backed_tokens,
+                max(num_computed_tokens - cpu_backed_tokens, 0),
+            )
             return
 
         self._release_pause_cpu_pin(request_id)
@@ -2735,6 +2745,33 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING
         )
         self.waiting.prepend_request(request)
+        logger.info(
+            "Resumed GPU-backed request: request_id=%s computed_tokens=%d",
+            request_id,
+            num_computed_tokens,
+        )
+
+    def _log_pause_acknowledgement(self, request_id: str) -> None:
+        if request_id not in self._paused_requests:
+            return
+        num_computed_tokens = self._pause_num_computed_tokens.get(request_id, 0)
+        cpu_backed_tokens = self._pause_cpu_backed_tokens.get(request_id, 0)
+        gpu_hard_pinned_tokens = (
+            max(num_computed_tokens - cpu_backed_tokens, 0)
+            if cpu_backed_tokens
+            else num_computed_tokens
+        )
+        logger.info(
+            "Paused request acknowledged: request_id=%s computed_tokens=%d "
+            "cpu_backed_tokens=%d gpu_hard_pinned_tokens=%d "
+            "connector_pending=%s paused_requests=%d",
+            request_id,
+            num_computed_tokens,
+            cpu_backed_tokens,
+            gpu_hard_pinned_tokens,
+            request_id in self._pause_cpu_waiting,
+            len(self._paused_requests),
+        )
 
     def _finalize_pending_pauses(self) -> None:
         for request_id in list(self._pending_pause_req_ids):
@@ -2763,6 +2800,7 @@ class Scheduler(SchedulerInterface):
     def _flush_pause_acknowledgements(self) -> None:
         for request_id in tuple(self._pause_ack_ready_ids):
             self._pause_ack_ready_ids.remove(request_id)
+            self._log_pause_acknowledgement(request_id)
             self._complete_request_operation(self._pause_waiters, request_id)
             request = self._paused_requests.get(request_id)
             if request is not None and any(
@@ -2830,6 +2868,7 @@ class Scheduler(SchedulerInterface):
                     request_id not in self._pending_pause_req_ids
                     and request_id not in self._pause_cpu_waiting
                 ):
+                    self._log_pause_acknowledgement(request_id)
                     self._complete_request_operation(
                         self._pause_waiters, request_id
                     )
@@ -3004,6 +3043,9 @@ class Scheduler(SchedulerInterface):
             - self.num_waiting_for_streaming_input
         )
         return num_waiting + len(self.running) + len(self._paused_requests)
+
+    def get_paused_request_ids(self) -> tuple[str, ...]:
+        return tuple(self._paused_requests)
 
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:

@@ -213,6 +213,11 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    @abstractmethod
+    def get_paused_request_ids(self) -> tuple[str, ...]:
+        """Return request IDs held in the per-request paused state."""
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:
