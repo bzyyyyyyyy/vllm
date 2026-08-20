@@ -6,6 +6,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+    TransferJob,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -22,7 +26,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
+    GPULoadStoreSpec,
     OffloadingSpec,
+    TransferResult,
 )
 
 NUM_BLOCKS = 10
@@ -109,6 +115,45 @@ def _make_worker(kv_cache_config: KVCacheConfig):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("submit_success", [False, True])
+def test_load_failure_reports_invalid_gpu_blocks(submit_success: bool):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+
+    connector_worker = OffloadingConnectorWorker(spec=MagicMock())
+    connector_worker.worker = MagicMock()
+    connector_worker.worker.submit_load.return_value = submit_success
+    connector_worker.worker.get_finished.return_value = (
+        [TransferResult(job_id=7, success=False)] if submit_success else []
+    )
+    dst_spec = GPULoadStoreSpec(
+        [3, 0, 4],
+        group_sizes=[3],
+        block_indices=[0],
+    )
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={
+            7: TransferJob(
+                req_id="failed-load",
+                src_spec=MagicMock(),
+                dst_spec=dst_spec,
+            )
+        },
+        store_jobs={},
+    )
+
+    connector_worker.start_kv_transfers(metadata)
+    _, finished_recving = connector_worker.get_finished(set())
+
+    assert finished_recving == {"failed-load"}
+    assert connector_worker.get_block_ids_with_load_errors() == {3, 4}
+    assert connector_worker.get_block_ids_with_load_errors() == set()
+    worker_meta = connector_worker.build_connector_worker_meta()
+    assert worker_meta is not None
+    assert worker_meta.failed_jobs == {7: 1}
 
 
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)

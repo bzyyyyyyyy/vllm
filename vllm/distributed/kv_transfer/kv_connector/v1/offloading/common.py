@@ -76,18 +76,22 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
 class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     """Worker -> Scheduler metadata for completed transfer jobs.
 
-    Each worker reports {job_id: 1} for newly completed transfer jobs
-    (load or store). aggregate() sums counts across workers within a step.
-    The scheduler accumulates across steps and processes
-    a transfer completion only when count reaches num_workers.
+    Each worker reports {job_id: 1} for newly completed or failed transfer
+    jobs. aggregate() sums counts across workers within a step. The scheduler
+    accumulates across steps and resolves a job only when every worker reports.
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
+    failed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+
+    def mark_failed(self, job_id: int) -> None:
+        """Record a failed transfer job from this worker."""
+        self.failed_jobs[job_id] = 1
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -98,7 +102,12 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
+        merged_failed = dict(self.failed_jobs)
+        for job_id, v in other.failed_jobs.items():
+            merged_failed[job_id] = merged_failed.get(job_id, 0) + v
+
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
+            failed_jobs=merged_failed,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
         )

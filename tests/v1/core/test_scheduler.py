@@ -1332,6 +1332,8 @@ def test_pause_waiting_request_is_idempotent_and_resumable():
     assert scheduler.pause_requests([request.request_id]).result() is None
     assert request.status == RequestStatus.PAUSED
     assert request not in scheduler.waiting
+    assert scheduler.get_num_unfinished_requests() == 1
+    assert not scheduler.has_requests()
     assert scheduler.pause_requests([request.request_id]).result() is None
 
     assert scheduler.resume_requests([request.request_id]).result() is None
@@ -1340,11 +1342,15 @@ def test_pause_waiting_request_is_idempotent_and_resumable():
     assert scheduler.resume_requests([request.request_id]).result() is None
 
 
-def test_pause_waits_for_inflight_step_and_restores_same_kv_blocks():
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_pause_waits_for_inflight_step_and_restores_same_kv_blocks(
+    async_scheduling: bool,
+):
     scheduler = create_scheduler(
         enable_prefix_caching=True,
         block_size=4,
         max_num_batched_tokens=32,
+        async_scheduling=async_scheduling,
     )
     (request,) = create_requests(
         num_requests=1,
@@ -1378,6 +1384,28 @@ def test_pause_waits_for_inflight_step_and_restores_same_kv_blocks():
     assert request.request_id in resumed_output.num_scheduled_tokens
 
 
+def test_pause_and_resume_multiple_requests_are_best_effort():
+    scheduler = create_scheduler(block_size=4, max_num_batched_tokens=32)
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-multi-0", "pause-multi-1"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.pause_requests(
+        [requests[0].request_id, "unknown", requests[1].request_id]
+    ).result()
+    assert all(request.status == RequestStatus.PAUSED for request in requests)
+
+    scheduler.resume_requests(
+        [requests[0].request_id, "finished-or-unknown", requests[1].request_id]
+    ).result()
+    assert all(request.status == RequestStatus.WAITING for request in requests)
+
+
 def test_abort_paused_request_releases_gpu_pin():
     scheduler = create_scheduler(block_size=4, max_num_batched_tokens=32)
     (request,) = create_requests(
@@ -1408,6 +1436,7 @@ def test_pause_cpu_backing_failure_falls_back_to_gpu_pin():
     output = scheduler.schedule()
     _model_output(scheduler, output, [[42]])
     connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
     connector.pin_request_kv.side_effect = RuntimeError("CPU cache full")
     connector.unpin_prefix.return_value = False
     scheduler.connector = connector
@@ -1420,7 +1449,11 @@ def test_pause_cpu_backing_failure_falls_back_to_gpu_pin():
 
 
 def test_pause_waits_for_cpu_backing_before_acknowledging():
-    scheduler = create_scheduler(block_size=4, max_num_batched_tokens=32)
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
     (request,) = create_requests(
         num_requests=1,
         num_tokens=7,
@@ -1431,8 +1464,10 @@ def test_pause_waits_for_cpu_backing_before_acknowledging():
     output = scheduler.schedule()
     _model_output(scheduler, output, [[42]])
     connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
     connector.pin_request_kv.return_value = True
     connector.is_prefix_pin_ready.return_value = False
+    connector.get_prefix_pin_error.return_value = None
     connector.unpin_prefix.return_value = True
     scheduler.connector = connector
 
@@ -1446,10 +1481,206 @@ def test_pause_waits_for_cpu_backing_before_acknowledging():
     scheduler.schedule()
     assert pause_future.result() is None
 
+    gpu_pin_id = scheduler._pause_pin_id(request.request_id)
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    assert len(manager.pin_id_to_blocks[gpu_pin_id]) == 1
+    assert request.num_computed_tokens == 0
+
     scheduler.resume_requests([request.request_id]).result()
+    assert request.status == RequestStatus.PREEMPTED
+    connector.unpin_prefix.assert_not_called()
+
+    connector.get_num_new_matched_tokens.return_value = (0, False)
+    connector.update_state_after_alloc.return_value = None
+    connector.build_connector_meta.return_value = None
+    resumed_output = scheduler.schedule()
+    assert resumed_output.num_scheduled_tokens[request.request_id] == 1
+    assert request.num_computed_tokens == 8
     connector.unpin_prefix.assert_called_once_with(
         scheduler._pause_cpu_pin_id(request.request_id)
     )
+
+
+def test_pause_cpu_backed_prefix_can_be_evicted_and_reloaded_without_tail_recompute():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-cpu-reload"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    _model_output(scheduler, output, [[42]])
+
+    connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.pin_request_kv.return_value = True
+    connector.is_prefix_pin_ready.return_value = True
+    connector.get_prefix_pin_error.return_value = None
+    connector.unpin_prefix.return_value = True
+    connector.get_num_new_matched_tokens.return_value = (4, True)
+    connector.update_state_after_alloc.return_value = None
+    connector.build_connector_meta.return_value = None
+    connector.get_kv_connector_stats.return_value = None
+    connector.has_pending_push_work.return_value = False
+    connector.take_events.return_value = ()
+    scheduler.connector = connector
+
+    scheduler.pause_requests([request.request_id]).result()
+    prefix_block_id = original_block_ids[0][0]
+    tail_block_id = original_block_ids[0][1]
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    assert manager.block_pool.blocks[prefix_block_id].ref_cnt == 0
+    assert manager.pin_id_to_blocks[
+        scheduler._pause_pin_id(request.request_id)
+    ][0].block_id == tail_block_id
+
+    manager.block_pool.evict_blocks({prefix_block_id})
+    scheduler.resume_requests([request.request_id]).result()
+    load_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.request_id not in load_output.num_scheduled_tokens
+    connector.unpin_prefix.assert_not_called()
+
+    # A failed CPU -> GPU copy remains retryable even under the global
+    # connector "fail" policy because the hard CPU pin is authoritative.
+    scheduler.recompute_kv_load_failures = False
+    failed_gpu_block_id = scheduler.kv_cache_manager.get_block_ids(
+        request.request_id
+    )[0][0]
+    scheduler.update_from_output(
+        load_output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_recving=[request.request_id],
+                invalid_block_ids={failed_gpu_block_id},
+            ),
+        ),
+    )
+    retry_load_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.request_id not in retry_load_output.num_scheduled_tokens
+    assert request.request_id in scheduler.requests
+    connector.unpin_prefix.assert_not_called()
+
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    resumed_output = scheduler.schedule()
+    assert resumed_output.num_scheduled_tokens[request.request_id] == 1
+    assert request.num_computed_tokens == 8
+    restored_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert restored_block_ids[0][1] == tail_block_id
+    connector.unpin_prefix.assert_called_once_with(
+        scheduler._pause_cpu_pin_id(request.request_id)
+    )
+
+
+def test_repause_waits_for_inflight_cpu_restore_before_releasing_gpu_blocks():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["repause-cpu-restore"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    _model_output(scheduler, output, [[42]])
+
+    connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.pin_request_kv.return_value = True
+    connector.is_prefix_pin_ready.return_value = True
+    connector.get_prefix_pin_error.return_value = None
+    connector.unpin_prefix.return_value = True
+    connector.get_num_new_matched_tokens.return_value = (4, True)
+    connector.update_state_after_alloc.return_value = None
+    connector.build_connector_meta.return_value = None
+    connector.get_kv_connector_stats.return_value = None
+    connector.has_pending_push_work.return_value = False
+    connector.take_events.return_value = ()
+    scheduler.connector = connector
+
+    scheduler.pause_requests([request.request_id]).result()
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    manager.block_pool.evict_blocks({original_block_ids[0][0]})
+    scheduler.resume_requests([request.request_id]).result()
+    scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    pause_future = scheduler.pause_requests([request.request_id])
+    assert not pause_future.done()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    paused_output = scheduler.schedule()
+    assert pause_future.result() is None
+    assert request.status == RequestStatus.PAUSED
+    assert request.request_id not in paused_output.num_scheduled_tokens
+    assert request.request_id in scheduler._pause_cpu_pin_ids
+    assert manager.pin_id_to_blocks[
+        scheduler._pause_pin_id(request.request_id)
+    ][0].block_id == original_block_ids[0][1]
+
+    scheduler.resume_requests([request.request_id]).result()
+    resumed_output = scheduler.schedule()
+    assert resumed_output.num_scheduled_tokens[request.request_id] == 1
+    connector.unpin_prefix.assert_called_once_with(
+        scheduler._pause_cpu_pin_id(request.request_id)
+    )
+
+
+def test_pause_async_cpu_store_failure_falls_back_to_full_gpu_pin():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-cpu-store-failure"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[42]])
+
+    connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.pin_request_kv.return_value = True
+    connector.is_prefix_pin_ready.return_value = False
+    connector.get_prefix_pin_error.side_effect = [None, "store failed"]
+    connector.unpin_prefix.return_value = True
+    scheduler.connector = connector
+
+    pause_future = scheduler.pause_requests([request.request_id])
+    assert not pause_future.done()
+    scheduler._try_complete_paused_cpu_backing()
+    assert request.request_id in scheduler._pause_cpu_waiting
+    scheduler._try_complete_paused_cpu_backing()
+    scheduler.schedule()
+
+    assert pause_future.result() is None
+    assert request.request_id in scheduler._pause_pin_ids
+    assert request.request_id not in scheduler._pause_cpu_pin_ids
+    assert request.num_computed_tokens == 7
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])

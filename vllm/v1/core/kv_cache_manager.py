@@ -484,11 +484,32 @@ class KVCacheManager:
     def pin_request_blocks(self, pin_id: str, request: Request) -> tuple[list[int], ...]:
         return self.coordinator.pin_request_blocks(pin_id, request.request_id)
 
+    def pin_request_suffix(
+        self,
+        pin_id: str,
+        request: Request,
+        suffix_start_tokens: int,
+        num_computed_tokens: int,
+    ) -> tuple[list[int], ...]:
+        """Demote a request prefix to cache while hard-pinning its suffix."""
+        return self.coordinator.pin_request_suffix(
+            pin_id,
+            request.request_id,
+            suffix_start_tokens,
+            num_computed_tokens,
+        )
+
     def restore_request_blocks(
         self, pin_id: str, request: Request
     ) -> tuple[list[int], ...]:
         """Transfer pinned KV block ownership back to a paused request."""
         return self.coordinator.restore_request_blocks(pin_id, request.request_id)
+
+    def restore_request_suffix(
+        self, pin_id: str, request: Request
+    ) -> tuple[list[int], ...]:
+        """Append a retained pause suffix to a reconstructed request prefix."""
+        return self.coordinator.restore_request_suffix(pin_id, request.request_id)
 
     def unpin_prefix(self, pin_id: str) -> bool:
         return self.coordinator.unpin_prefix(pin_id)

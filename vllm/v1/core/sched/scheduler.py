@@ -353,6 +353,10 @@ class Scheduler(SchedulerInterface):
         self._pause_pin_ids: dict[str, str] = {}
         self._pending_pause_req_ids: set[str] = set()
         self._pause_cpu_pin_ids: dict[str, str] = {}
+        self._pause_num_computed_tokens: dict[str, int] = {}
+        self._pause_cpu_backed_tokens: dict[str, int] = {}
+        self._pause_tail_req_ids: set[str] = set()
+        self._resuming_paused_req_ids: set[str] = set()
         self._pause_cpu_waiting: set[str] = set()
         self._pause_ack_ready_ids: set[str] = set()
         self._pause_waiters: dict[Future[None], set[str]] = {}
@@ -420,7 +424,11 @@ class Scheduler(SchedulerInterface):
         # Complete strong pause acknowledgements only on the scheduling turn
         # after the in-flight output was processed. This preserves output-queue
         # ordering: the final pre-pause token is delivered before pause() returns.
+        # A re-pause requested during an async CPU restore has no model output;
+        # finalize it here once the connector receive fence becomes ready.
+        self._finalize_pending_pauses()
         self._flush_pause_acknowledgements()
+        self._restore_ready_resumed_pause_states()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -502,6 +510,17 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            pause_resume_boundary = self._pause_cpu_backed_tokens.get(
+                request.request_id
+            )
+            if (
+                request.request_id in self._resuming_paused_req_ids
+                and pause_resume_boundary is not None
+            ):
+                num_new_tokens = min(
+                    num_new_tokens,
+                    max(0, pause_resume_boundary - request.num_computed_tokens),
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -676,6 +695,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                pause_resume_boundary = (
+                    self._pause_cpu_backed_tokens.get(request_id)
+                    if request_id in self._resuming_paused_req_ids
+                    else None
+                )
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -714,6 +738,12 @@ class Scheduler(SchedulerInterface):
                     if request.pin_prefix_id is not None
                     else request.num_tokens - 1
                 )
+                if pause_resume_boundary is not None:
+                    # A pause snapshot owns the exact state at this boundary,
+                    # including a fully computed final block. Unlike ordinary
+                    # prefix reuse, it does not need to drop the last token for
+                    # re-sampling.
+                    default_max_cache_hit_length = pause_resume_boundary
                 max_cache_hit_length = default_max_cache_hit_length
                 if (
                     self.cache_config.enable_prefix_caching
@@ -805,6 +835,19 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+                        if pause_resume_boundary is not None:
+                            num_external_computed_tokens = min(
+                                num_external_computed_tokens,
+                                max(
+                                    0,
+                                    pause_resume_boundary
+                                    - num_new_local_computed_tokens,
+                                ),
+                            )
+                            load_kv_async = (
+                                load_kv_async
+                                and num_external_computed_tokens > 0
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -816,6 +859,16 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if (
+                        pause_resume_boundary is not None
+                        and num_computed_tokens != pause_resume_boundary
+                    ):
+                        raise RuntimeError(
+                            "CPU pause backing did not cover its exact restore "
+                            f"boundary: request_id={request_id!r} "
+                            f"available={num_computed_tokens} "
+                            f"required={pause_resume_boundary}"
+                        )
 
                     # Skip request with pending mm encoding prefetches
                     if (
@@ -863,6 +916,39 @@ class Scheduler(SchedulerInterface):
                         num_external_cached_tokens=num_external_computed_tokens,
                     )
 
+                # If the complete CPU-backed boundary is still resident in
+                # local APC, materialize its ownership without running a model
+                # step, then append the hard-pinned physical tail. CPU-backed
+                # misses follow the normal async connector path below.
+                if (
+                    pause_resume_boundary is not None
+                    and num_computed_tokens == pause_resume_boundary
+                    and not load_kv_async
+                ):
+                    prefix_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        0,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    if prefix_blocks is None:
+                        break
+                    if self.connector is not None:
+                        self.connector.update_state_after_alloc(
+                            request,
+                            self.kv_cache_manager.get_blocks(request_id),
+                            num_external_computed_tokens,
+                        )
+                    self._consume_prefix_dependency(request_id)
+                    request.num_computed_tokens = pause_resume_boundary
+                    self._restore_resumed_pause_state(request)
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_external_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
+
                 if (
                     request.pin_prefix_id is not None
                     and num_new_local_computed_tokens
@@ -903,6 +989,14 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if (
+                        request_id in self._resuming_paused_req_ids
+                        and pause_resume_boundary is not None
+                    ):
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            max(0, pause_resume_boundary - num_computed_tokens),
+                        )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -2380,10 +2474,7 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             self._pending_pause_req_ids.discard(request.request_id)
             self._pause_cpu_waiting.discard(request.request_id)
-            self._release_pause_cpu_pin(request.request_id)
-            if request.request_id in self._paused_requests:
-                self._restore_paused_request_blocks(request)
-                self._paused_requests.pop(request.request_id, None)
+            self._release_request_pause_state(request.request_id)
             self._complete_request_operation(self._pause_waiters, request.request_id)
             self._complete_request_operation(self._resume_waiters, request.request_id)
             delay_free_blocks = False
@@ -2434,6 +2525,86 @@ class Scheduler(SchedulerInterface):
     def _pause_cpu_pin_id(self, request_id: str) -> str:
         return f"__request_pause_cpu__:{request_id}"
 
+    def _release_request_pause_state(self, request_id: str) -> None:
+        """Release every scheduler-owned KV reference for a paused request."""
+        self._release_pause_cpu_pin(request_id)
+        pin_id = self._pause_pin_ids.pop(request_id, None)
+        if pin_id is not None:
+            self.kv_cache_manager.unpin_prefix(pin_id)
+        self._paused_requests.pop(request_id, None)
+        self._pause_num_computed_tokens.pop(request_id, None)
+        self._pause_cpu_backed_tokens.pop(request_id, None)
+        self._pause_tail_req_ids.discard(request_id)
+        self._resuming_paused_req_ids.discard(request_id)
+
+    def _demote_paused_gpu_prefix(self, request: Request) -> None:
+        """Make a CPU-backed paused prefix evictable while retaining its tail."""
+        request_id = request.request_id
+        backed_tokens = self._pause_cpu_backed_tokens[request_id]
+        num_computed_tokens = self._pause_num_computed_tokens[request_id]
+        pin_id = self._pause_pin_ids.pop(request_id)
+
+        # Temporarily return the complete table to the request, then split it
+        # into an evictable cached prefix and a hard-pinned unaligned suffix.
+        self.kv_cache_manager.restore_request_blocks(pin_id, request)
+        self.kv_cache_manager.cache_blocks(request, backed_tokens)
+        self.kv_cache_manager.pin_request_suffix(
+            pin_id,
+            request,
+            backed_tokens,
+            num_computed_tokens,
+        )
+        if num_computed_tokens > backed_tokens:
+            self._pause_pin_ids[request_id] = pin_id
+            self._pause_tail_req_ids.add(request_id)
+        else:
+            # An empty suffix pin is only a temporary ownership-transfer aid.
+            self.kv_cache_manager.unpin_prefix(pin_id)
+
+        # Resume will reconstruct the aligned prefix from local APC and/or the
+        # hard CPU copy, then append the retained physical suffix.
+        request.num_computed_tokens = 0
+        request.spec_token_ids.clear()
+        self.reset_preempted_req_ids.add(request_id)
+
+    def _restore_resumed_pause_state(self, request: Request) -> bool:
+        """Finish a CPU-backed resume once its aligned prefix is GPU-owned."""
+        request_id = request.request_id
+        if request_id not in self._resuming_paused_req_ids:
+            return False
+        backed_tokens = self._pause_cpu_backed_tokens[request_id]
+        if request.num_computed_tokens < backed_tokens:
+            return False
+        if request.num_computed_tokens != backed_tokens:
+            raise RuntimeError(
+                "resumed request advanced beyond its retained suffix boundary: "
+                f"request_id={request_id!r} computed={request.num_computed_tokens} "
+                f"boundary={backed_tokens}"
+            )
+
+        if request_id in self._pause_tail_req_ids:
+            pin_id = self._pause_pin_ids.pop(request_id)
+            self.kv_cache_manager.restore_request_suffix(pin_id, request)
+            self._pause_tail_req_ids.remove(request_id)
+
+        request.num_computed_tokens = self._pause_num_computed_tokens.pop(request_id)
+        self._release_pause_cpu_pin(request_id)
+        self._pause_cpu_backed_tokens.pop(request_id, None)
+        self._resuming_paused_req_ids.remove(request_id)
+        return True
+
+    def _restore_ready_resumed_pause_states(self) -> None:
+        for request_id in tuple(self._resuming_paused_req_ids):
+            request = self.requests.get(request_id)
+            if request is None or request.status in (
+                RequestStatus.PAUSED,
+                RequestStatus.WAITING_FOR_REMOTE_KVS,
+            ):
+                continue
+            if request.last_sched_seq > self.processed_step_seq:
+                continue
+            self._restore_resumed_pause_state(request)
+
     def _pause_request(self, request: Request) -> bool:
         request_id = request.request_id
         if request_id in self._paused_requests or request.is_finished():
@@ -2449,14 +2620,39 @@ class Scheduler(SchedulerInterface):
 
         self._remove_inflight_prefix_request(request_id)
         self._inflight_prefills.discard(request)
-        if request.num_computed_tokens:
+
+        # A request resumed from CPU may be paused again before its retained
+        # suffix is reattached. Its original CPU/tail pins are still the
+        # authoritative snapshot, so discard only the transient reconstructed
+        # prefix and return to PAUSED without starting another store.
+        if request_id in self._resuming_paused_req_ids:
+            backed_tokens = self._pause_cpu_backed_tokens[request_id]
+            transient_computed_tokens = request.num_computed_tokens
+            if transient_computed_tokens:
+                self.kv_cache_manager.cache_blocks(
+                    request,
+                    min(transient_computed_tokens, backed_tokens),
+                )
+            self.kv_cache_manager.free(request)
+            request.num_computed_tokens = 0
+            request.spec_token_ids.clear()
+            request.status = RequestStatus.PAUSED
+            self._resuming_paused_req_ids.remove(request_id)
+            self._paused_requests[request_id] = request
+            if transient_computed_tokens:
+                self.reset_preempted_req_ids.add(request_id)
+            return True
+
+        num_computed_tokens = min(request.num_computed_tokens, request.num_tokens)
+        if num_computed_tokens:
             self.kv_cache_manager.cache_blocks(
-                request, min(request.num_computed_tokens, request.num_tokens)
+                request, num_computed_tokens
             )
 
         pin_id = self._pause_pin_id(request_id)
         self.kv_cache_manager.pin_request_blocks(pin_id, request)
         self._pause_pin_ids[request_id] = pin_id
+        self._pause_num_computed_tokens[request_id] = num_computed_tokens
         self._paused_requests[request_id] = request
         request.spec_token_ids.clear()
         request.status = RequestStatus.PAUSED
@@ -2464,18 +2660,32 @@ class Scheduler(SchedulerInterface):
         # Prefer an additional hard CPU backing when the configured connector
         # supports it. Any unsupported/capacity failure falls back to the GPU
         # hard pin above, so pausing itself remains reliable.
-        if self.connector is not None and request.num_computed_tokens:
+        if self.connector is not None and num_computed_tokens:
             cpu_pin_id = self._pause_cpu_pin_id(request_id)
             try:
-                if self.connector.pin_request_kv(
-                    cpu_pin_id, request, request.num_computed_tokens
-                ):
-                    self._pause_cpu_pin_ids[request_id] = cpu_pin_id
-                    if self.connector.is_prefix_pin_ready(cpu_pin_id):
-                        self.reset_preempted_req_ids.add(request_id)
-                        return True
-                    self._pause_cpu_waiting.add(request_id)
-                    return False
+                alignment = self.connector.get_prefix_pin_alignment()
+                cpu_backed_tokens = (
+                    num_computed_tokens // alignment * alignment
+                    if isinstance(alignment, int)
+                    and not isinstance(alignment, bool)
+                    and alignment > 0
+                    else 0
+                )
+                if cpu_backed_tokens:
+                    cpu_pin_blocks = self.connector.pin_request_kv(
+                        cpu_pin_id, request, cpu_backed_tokens
+                    )
+                    if cpu_pin_blocks:
+                        self._pause_cpu_pin_ids[request_id] = cpu_pin_id
+                        self._pause_cpu_backed_tokens[request_id] = cpu_backed_tokens
+                        if self.connector.is_prefix_pin_ready(cpu_pin_id):
+                            self._demote_paused_gpu_prefix(request)
+                            return True
+                        self._pause_cpu_waiting.add(request_id)
+                        return False
+                    # A connector may reserve a pin before discovering that
+                    # this request has no compatible offloadable blocks.
+                    self.connector.unpin_prefix(cpu_pin_id)
             except Exception:
                 logger.warning(
                     "CPU KV backing unavailable for paused request %s; "
@@ -2484,10 +2694,12 @@ class Scheduler(SchedulerInterface):
                     exc_info=True,
                 )
                 self.connector.unpin_prefix(cpu_pin_id)
+                self._pause_cpu_backed_tokens.pop(request_id, None)
 
         # Drop worker-side request state only after any CPU store has consumed
         # its source block table. The scheduler-side GPU pin remains retained.
-        self.reset_preempted_req_ids.add(request_id)
+        if num_computed_tokens:
+            self.reset_preempted_req_ids.add(request_id)
         return True
 
     def _release_pause_cpu_pin(self, request_id: str) -> None:
@@ -2504,14 +2716,23 @@ class Scheduler(SchedulerInterface):
         request_id = request.request_id
         if request_id not in self._paused_requests:
             return
-        self._release_pause_cpu_pin(request_id)
-        self._restore_paused_request_blocks(request)
         self._paused_requests.pop(request_id)
         request.spec_token_ids.clear()
-        request.status = (
-            RequestStatus.PREEMPTED
-            if request.num_computed_tokens > 0
-            else RequestStatus.WAITING
+
+        if request_id in self._pause_cpu_backed_tokens:
+            # The aligned prefix is reconstructed lazily by normal local/remote
+            # cache lookup. Keep both CPU and tail pins until ownership is whole.
+            self._resuming_paused_req_ids.add(request_id)
+            request.status = RequestStatus.PREEMPTED
+            self.waiting.prepend_request(request)
+            return
+
+        self._release_pause_cpu_pin(request_id)
+        self._restore_paused_request_blocks(request)
+        self._pause_num_computed_tokens.pop(request_id, None)
+        self._pause_tail_req_ids.discard(request_id)
+        request.status = RequestStatus.PREEMPTED if request.num_computed_tokens else (
+            RequestStatus.WAITING
         )
         self.waiting.prepend_request(request)
 
@@ -2520,6 +2741,16 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(request_id)
             if request is not None and request.last_sched_seq > self.processed_step_seq:
                 continue
+            if (
+                request is not None
+                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
+                if request_id not in self.finished_recving_kv_req_ids:
+                    continue
+                # The destination blocks are no longer being written. Commit
+                # any valid received prefix before the re-pause path releases
+                # its transient request ownership.
+                self._update_waiting_for_remote_kv(request)
             self._pending_pause_req_ids.remove(request_id)
             if request is None or request.is_finished():
                 self._pause_ack_ready_ids.add(request_id)
@@ -2545,10 +2776,30 @@ class Scheduler(SchedulerInterface):
             return
         for request_id in tuple(self._pause_cpu_waiting):
             cpu_pin_id = self._pause_cpu_pin_ids.get(request_id)
-            if cpu_pin_id is None or not self.connector.is_prefix_pin_ready(cpu_pin_id):
+            if cpu_pin_id is None:
+                continue
+            pin_error = self.connector.get_prefix_pin_error(cpu_pin_id)
+            if isinstance(pin_error, str) and pin_error:
+                logger.warning(
+                    "CPU KV backing failed for paused request %s; retaining "
+                    "its hard-pinned GPU KV: %s",
+                    request_id,
+                    pin_error,
+                )
+                self._pause_cpu_waiting.remove(request_id)
+                self._release_pause_cpu_pin(request_id)
+                self._pause_cpu_backed_tokens.pop(request_id, None)
+                self.reset_preempted_req_ids.add(request_id)
+                self._pause_ack_ready_ids.add(request_id)
+                continue
+            if not self.connector.is_prefix_pin_ready(cpu_pin_id):
                 continue
             self._pause_cpu_waiting.remove(request_id)
-            self.reset_preempted_req_ids.add(request_id)
+            request = self._paused_requests.get(request_id)
+            if request is None:
+                self._release_pause_cpu_pin(request_id)
+                continue
+            self._demote_paused_gpu_prefix(request)
             self._pause_ack_ready_ids.add(request_id)
 
     def pause_requests(self, request_ids: list[str]) -> Future[None]:
@@ -2564,7 +2815,10 @@ class Scheduler(SchedulerInterface):
             ):
                 continue
             pending_ids.add(request_id)
-            if request.last_sched_seq > self.processed_step_seq:
+            if (
+                request.last_sched_seq > self.processed_step_seq
+                or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
                 self._pending_pause_req_ids.add(request_id)
             else:
                 self._pause_request(request)
@@ -3042,7 +3296,10 @@ class Scheduler(SchedulerInterface):
 
             # on a full prompt hit, we need to re-compute the last token
             # in order to be able to sample the next token
-            if request.num_computed_tokens == request.num_tokens:
+            if (
+                request.num_computed_tokens == request.num_tokens
+                and request.request_id not in self._resuming_paused_req_ids
+            ):
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
@@ -3057,8 +3314,20 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            load_failed = request.request_id in self.failed_recving_kv_req_ids
+            pause_resume = request.request_id in self._resuming_paused_req_ids
             self._update_waiting_for_remote_kv(request)
-            if request.num_preemptions:
+            if pause_resume:
+                if load_failed:
+                    # Keep the authoritative CPU/tail pins and retry lookup.
+                    # Any successfully loaded prefix blocks remain ordinary APC
+                    # entries after freeing this transient request ownership.
+                    self.kv_cache_manager.free(request)
+                    request.num_computed_tokens = 0
+                    self.reset_preempted_req_ids.add(request.request_id)
+                else:
+                    self._restore_resumed_pause_state(request)
+            if request.num_preemptions or pause_resume:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
@@ -3274,15 +3543,32 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
 
         if should_fail:
-            all_failed_req_ids = async_failed_req_ids | sync_failed_req_ids
-            logger.error(
-                "Failing %d request(s) due to KV load failure "
-                "(failure_policy=fail, %d tokens affected). Request IDs: %s",
-                total_failed_requests,
-                total_failed_tokens,
-                all_failed_req_ids,
+            # A resumed pause still owns an authoritative hard CPU pin. A
+            # failed copy into transient GPU blocks is therefore retryable even
+            # when ordinary connector loads use the global "fail" policy.
+            retryable_pause_req_ids = (
+                async_failed_req_ids & self._resuming_paused_req_ids
             )
-            return all_failed_req_ids
+            failed_req_ids = (
+                async_failed_req_ids - retryable_pause_req_ids
+            ) | sync_failed_req_ids
+            self.failed_recving_kv_req_ids |= retryable_pause_req_ids
+            if retryable_pause_req_ids:
+                logger.warning(
+                    "Retrying %d CPU-backed paused request(s) after KV load "
+                    "failure: %s",
+                    len(retryable_pause_req_ids),
+                    retryable_pause_req_ids,
+                )
+            if failed_req_ids:
+                logger.error(
+                    "Failing %d request(s) due to KV load failure "
+                    "(failure_policy=fail, %d tokens affected). Request IDs: %s",
+                    len(failed_req_ids),
+                    total_failed_tokens,
+                    failed_req_ids,
+                )
+            return failed_req_ids
 
         logger.warning(
             "Recovered from KV load failure: "

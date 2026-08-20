@@ -298,11 +298,36 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def pin_request_suffix(
+        self,
+        pin_id: str,
+        request_id: str,
+        suffix_start_tokens: int,
+        num_computed_tokens: int,
+    ) -> tuple[list[int], ...]:
+        return tuple(
+            manager.pin_request_suffix(
+                pin_id,
+                request_id,
+                suffix_start_tokens,
+                num_computed_tokens,
+            )
+            for manager in self.single_type_managers
+        )
+
     def restore_request_blocks(
         self, pin_id: str, request_id: str
     ) -> tuple[list[int], ...]:
         return tuple(
             manager.restore_request_blocks(pin_id, request_id)
+            for manager in self.single_type_managers
+        )
+
+    def restore_request_suffix(
+        self, pin_id: str, request_id: str
+    ) -> tuple[list[int], ...]:
+        return tuple(
+            manager.restore_request_suffix(pin_id, request_id)
             for manager in self.single_type_managers
         )
 

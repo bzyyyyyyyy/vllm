@@ -26,6 +26,15 @@ def test_aggregate_disjoint_jobs():
     assert result.completed_jobs == {42: 1, 7: 1, 43: 1, 8: 1}
 
 
+def test_aggregate_failed_jobs():
+    meta1 = OffloadingWorkerMetadata(failed_jobs={42: 1})
+    meta2 = OffloadingWorkerMetadata(failed_jobs={42: 1, 7: 1})
+
+    result = meta1.aggregate(meta2)
+
+    assert result.failed_jobs == {42: 2, 7: 1}
+
+
 def test_aggregate_multiple_workers():
     meta1 = OffloadingWorkerMetadata(completed_jobs={42: 1, 43: 1, 7: 1})
     meta2 = OffloadingWorkerMetadata(completed_jobs={42: 1, 7: 1, 8: 1})

@@ -87,6 +87,7 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block: dict[str, int] = {}
         self.pin_id_to_blocks: dict[str, list[KVCacheBlock]] = {}
         self.pin_id_to_num_cached_blocks: dict[str, int | None] = {}
+        self.pin_id_to_suffix_start_block: dict[str, int] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -417,6 +418,64 @@ class SingleTypeKVCacheManager(ABC):
         self.pin_id_to_num_cached_blocks[pin_id] = num_cached_blocks
         return [block.block_id for block in blocks if not block.is_null]
 
+    def pin_request_suffix(
+        self,
+        pin_id: str,
+        request_id: str,
+        suffix_start_tokens: int,
+        num_computed_tokens: int,
+    ) -> list[int]:
+        """Keep only a computed request suffix under a hard GPU pin.
+
+        Blocks before ``suffix_start_tokens`` are returned to the normal block
+        pool. When prefix caching is enabled, their hashes remain intact and
+        they therefore become ordinary evictable prefix-cache entries. Blocks
+        after ``num_computed_tokens`` are uncomputed/lookahead capacity and are
+        released as well.
+
+        The retained suffix keeps its existing reference. It can later be
+        appended to a request whose prefix block table has been reconstructed
+        with :meth:`restore_request_suffix`.
+        """
+        if pin_id in self.pin_id_to_blocks:
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        if suffix_start_tokens < 0 or num_computed_tokens < suffix_start_tokens:
+            raise ValueError(
+                "invalid pinned suffix token range: "
+                f"start={suffix_start_tokens} end={num_computed_tokens}"
+            )
+        if suffix_start_tokens % self.block_size != 0:
+            raise ValueError(
+                "pinned suffix must start on a cache-group block boundary: "
+                f"start={suffix_start_tokens} block_size={self.block_size}"
+            )
+
+        suffix_start_block = suffix_start_tokens // self.block_size
+        suffix_end_block = cdiv(num_computed_tokens, self.block_size)
+        owned_blocks = self.req_to_blocks.get(request_id)
+        if owned_blocks is None or suffix_end_block > len(owned_blocks):
+            raise ValueError(
+                "request does not own enough blocks for pinned suffix: "
+                f"request_id={request_id!r} "
+                f"owned={len(owned_blocks) if owned_blocks is not None else 0} "
+                f"required={suffix_end_block}"
+            )
+
+        num_cached_blocks = self.num_cached_block.get(request_id)
+        blocks = self.pop_blocks_for_free(request_id)
+        prefix_blocks = blocks[:suffix_start_block]
+        suffix_blocks = blocks[suffix_start_block:suffix_end_block]
+        unused_blocks = blocks[suffix_end_block:]
+
+        # Preserve the suffix's existing ownership reference. Everything else
+        # returns to the normal pool; hashed prefix blocks become LRU-evictable.
+        self.pin_id_to_blocks[pin_id] = suffix_blocks
+        self.pin_id_to_num_cached_blocks[pin_id] = num_cached_blocks
+        self.pin_id_to_suffix_start_block[pin_id] = suffix_start_block
+        self.block_pool.free_blocks(reversed(unused_blocks))
+        self.block_pool.free_blocks(reversed(prefix_blocks))
+        return [block.block_id for block in suffix_blocks if not block.is_null]
+
     def restore_request_blocks(self, pin_id: str, request_id: str) -> list[int]:
         """Transfer pinned KV block ownership back to a request."""
         if request_id in self.req_to_blocks:
@@ -428,11 +487,38 @@ class SingleTypeKVCacheManager(ABC):
             self.num_cached_block[request_id] = num_cached_blocks
         return [block.block_id for block in blocks if not block.is_null]
 
+    def restore_request_suffix(self, pin_id: str, request_id: str) -> list[int]:
+        """Append a hard-pinned suffix to a reconstructed request prefix."""
+        blocks = self.pin_id_to_blocks.pop(pin_id)
+        num_cached_blocks = self.pin_id_to_num_cached_blocks.pop(pin_id, None)
+        suffix_start_block = self.pin_id_to_suffix_start_block.pop(pin_id)
+        req_blocks = self.req_to_blocks[request_id]
+        if len(req_blocks) != suffix_start_block:
+            # Put the pin back so the caller can retry or safely abort without
+            # losing ownership of the retained suffix.
+            self.pin_id_to_blocks[pin_id] = blocks
+            self.pin_id_to_num_cached_blocks[pin_id] = num_cached_blocks
+            self.pin_id_to_suffix_start_block[pin_id] = suffix_start_block
+            raise ValueError(
+                "reconstructed prefix does not meet pinned suffix boundary: "
+                f"request_id={request_id!r} prefix_blocks={len(req_blocks)} "
+                f"suffix_start_block={suffix_start_block}"
+            )
+
+        req_blocks.extend(blocks)
+        if num_cached_blocks is not None:
+            current_cached_blocks = self.num_cached_block.get(request_id, 0)
+            self.num_cached_block[request_id] = max(
+                current_cached_blocks, num_cached_blocks
+            )
+        return [block.block_id for block in blocks if not block.is_null]
+
     def unpin_prefix(self, pin_id: str) -> bool:
         blocks = self.pin_id_to_blocks.pop(pin_id, None)
         if blocks is None:
             return False
         self.pin_id_to_num_cached_blocks.pop(pin_id, None)
+        self.pin_id_to_suffix_start_block.pop(pin_id, None)
         self.block_pool.free_blocks(reversed(blocks))
         return True
 

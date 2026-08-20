@@ -608,6 +608,10 @@ class KVConnectorBase_V1(ABC):
         """Return whether every connector block for ``pin_id`` is readable."""
         return False
 
+    def get_prefix_pin_error(self, pin_id: str) -> str | None:
+        """Return a terminal asynchronous hard-pin error, if one occurred."""
+        return None
+
     def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
         """Return physical connector block IDs owned by a ready prefix pin."""
         raise KeyError(pin_id)

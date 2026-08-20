@@ -63,6 +63,8 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    is_forced_store: bool = False
+    failed_count: int = 0
     # Store src block IDs whose ref_cnt protects them while the request
     # runs. Only registered in _block_id_to_pending_jobs on request_finished.
     non_sliding_window_block_ids: list[int] | None = None
@@ -353,6 +355,9 @@ class OffloadingConnectorScheduler:
         # Pausing must back up decode KV too, even when normal offloading is
         # configured as prompt-only. Values are completed-token boundaries.
         self._forced_store_req_ids: dict[ReqId, int] = {}
+        self._forced_store_pin_ids: dict[ReqId, str] = {}
+        self._failed_prefix_pins: dict[str, str] = {}
+        self._deferred_prefix_unpins: set[str] = set()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -693,6 +698,11 @@ class OffloadingConnectorScheduler:
         self, pin_id: str, request: Request, num_computed_tokens: int
     ) -> list[int]:
         """Reserve CPU blocks and force-store all fully completed KV blocks."""
+        if any(config.is_eagle_group for config in self.config.kv_group_configs):
+            # The normal EAGLE lookup deliberately drops its volatile trailing
+            # block. Until pause restore has an exact-state EAGLE load path,
+            # retaining the full request on GPU is the only no-recompute option.
+            return []
         self.on_new_request(request)
         req_status = self._req_status[request.request_id]
         req_status.max_offload_tokens = None
@@ -702,15 +712,40 @@ class OffloadingConnectorScheduler:
             req_status.req_context,
         )
         self._forced_store_req_ids[request.request_id] = num_computed_tokens
+        self._forced_store_pin_ids[request.request_id] = pin_id
         return block_ids
 
     def is_prefix_pin_ready(self, pin_id: str) -> bool:
         return self.manager.is_prefix_pin_ready(pin_id)
 
+    def get_prefix_pin_error(self, pin_id: str) -> str | None:
+        return self._failed_prefix_pins.get(pin_id)
+
     def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
         return self.manager.get_prefix_pin_block_ids(pin_id)
 
     def unpin_prefix(self, pin_id: str) -> bool:
+        self._failed_prefix_pins.pop(pin_id, None)
+        matching_req_ids: list[ReqId] = []
+        for req_id, request_pin_id in tuple(self._forced_store_pin_ids.items()):
+            if request_pin_id == pin_id:
+                matching_req_ids.append(req_id)
+                # Prevent a force-store which has not been emitted yet.
+                self._forced_store_req_ids.pop(req_id, None)
+
+        if any(
+            job_status.req_id in matching_req_ids
+            for job_status in self._jobs.values()
+        ):
+            # A worker may still be reading or writing a pinned CPU block. Keep
+            # the manager pin alive until every worker reports completion so
+            # the block cannot be recycled underneath the DMA.
+            self._deferred_prefix_unpins.add(pin_id)
+            return True
+
+        for req_id in matching_req_ids:
+            self._forced_store_pin_ids.pop(req_id, None)
+        self._deferred_prefix_unpins.discard(pin_id)
         return self.manager.unpin_prefix(pin_id)
 
     def has_pinned_prefix(self, pin_id: str) -> bool:
@@ -1088,6 +1123,7 @@ class OffloadingConnectorScheduler:
                 pending_count=self.config.num_workers,
                 keys=set(keys_to_store),
                 is_store=True,
+                is_forced_store=forced_num_tokens is not None,
                 non_sliding_window_block_ids=non_sliding_window_block_ids,
                 sliding_window_block_ids=sliding_window_block_ids or None,
             )
@@ -1207,23 +1243,49 @@ class OffloadingConnectorScheduler:
             else:
                 self._connector_stats.aggregate(transfer_stats)
 
-        for job_id, count in meta.completed_jobs.items():
+        reported_job_ids = set(meta.completed_jobs) | set(meta.failed_jobs)
+        for job_id in reported_job_ids:
+            completed_count = meta.completed_jobs.get(job_id, 0)
+            failed_count = meta.failed_jobs.get(job_id, 0)
+            count = completed_count + failed_count
             assert count > 0
             if job_id < self._stale_job_threshold:
                 logger.debug(
-                    "Skipping stale completed job %d (pre-reset counter: %d)",
+                    "Skipping stale transfer job %d (pre-reset counter: %d)",
                     job_id,
                     self._stale_job_threshold,
                 )
                 continue
             job_status = self._jobs[job_id]
             job_status.pending_count -= count
+            job_status.failed_count += failed_count
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
-            if job_status.is_store:
+            if job_status.failed_count:
+                is_pause_load = (
+                    not job_status.is_store
+                    and job_status.req_id in self._forced_store_pin_ids
+                )
+                if not (
+                    is_pause_load
+                    or (job_status.is_store and job_status.is_forced_store)
+                ):
+                    raise RuntimeError(
+                        "offloading KV transfer failed: "
+                        f"job_id={job_id} request_id={job_status.req_id!r}"
+                    )
+                if job_status.is_store:
+                    pin_id = self._forced_store_pin_ids.get(job_status.req_id)
+                    if pin_id is not None:
+                        self._failed_prefix_pins[pin_id] = (
+                            "forced CPU pause backing transfer failed"
+                        )
+                elif self._blocks_being_loaded:
+                    self._blocks_being_loaded.difference_update(job_status.keys)
+            elif job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
@@ -1242,6 +1304,15 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
+            pin_id = self._forced_store_pin_ids.get(job_status.req_id)
+            if pin_id in self._deferred_prefix_unpins and not any(
+                status.req_id == job_status.req_id
+                for status in self._jobs.values()
+            ):
+                self._deferred_prefix_unpins.remove(pin_id)
+                self._forced_store_pin_ids.pop(job_status.req_id, None)
+                self._failed_prefix_pins.pop(pin_id, None)
+                self.manager.unpin_prefix(pin_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 del self._req_status[job_status.req_id]
 
@@ -1347,6 +1418,10 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._forced_store_req_ids.clear()
+        self._forced_store_pin_ids.clear()
+        self._failed_prefix_pins.clear()
+        self._deferred_prefix_unpins.clear()
 
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
