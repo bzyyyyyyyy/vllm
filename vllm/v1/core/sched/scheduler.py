@@ -2318,6 +2318,16 @@ class Scheduler(SchedulerInterface):
             unpinned = self.connector.unpin_prefix(pin_id) or unpinned
         return unpinned
 
+    def pause_prefix(self, pin_id: str) -> Future[None]:
+        """Pause a pending prefix-pin request by its public pin ID."""
+        request_id = self._pin_prefix_request_ids.get(pin_id)
+        return self.pause_requests([] if request_id is None else [request_id])
+
+    def resume_prefix(self, pin_id: str) -> Future[None]:
+        """Resume a paused prefix-pin request by its public pin ID."""
+        request_id = self._pin_prefix_request_ids.get(pin_id)
+        return self.resume_requests([] if request_id is None else [request_id])
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:

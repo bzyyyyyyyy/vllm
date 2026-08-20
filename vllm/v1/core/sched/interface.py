@@ -174,6 +174,16 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def pause_prefix(self, pin_id: str):
+        """Pause a pending prefix-pin request, if one exists."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def resume_prefix(self, pin_id: str):
+        """Resume a paused prefix-pin request, if one exists."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_num_unfinished_requests(self) -> int:
         """Number of unfinished requests in the scheduler's internal queue."""
         raise NotImplementedError

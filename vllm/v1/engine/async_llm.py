@@ -403,6 +403,28 @@ class AsyncLLM(EngineClient):
             raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
         return await self.engine_core.call_utility_async("unpin_prefix", pin_id)
 
+    async def pause_prefix(self, pin_id: str) -> None:
+        """Pause a pending prefix-pin prefill without releasing its KV state.
+
+        Completed, released, and unknown prefix pins are treated as no-ops.
+        """
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        await self.engine_core.call_utility_async("pause_prefix", pin_id)
+
+    async def resume_prefix(self, pin_id: str) -> None:
+        """Resume a paused prefix-pin prefill from its retained KV state.
+
+        Completed, released, and unknown prefix pins are treated as no-ops.
+        """
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        await self.engine_core.call_utility_async("resume_prefix", pin_id)
+
     async def add_request(
         self,
         request_id: str,

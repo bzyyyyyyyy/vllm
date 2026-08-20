@@ -1621,6 +1621,125 @@ def test_unpin_prefix_aborts_pending_request():
         future.result()
 
 
+def test_pause_prefix_waiting_request_is_idempotent_and_resumable():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        block_size=4,
+        req_ids=["pin-request"],
+    )
+    pin_future = scheduler.pin_prefix("pin", pin_request)
+
+    assert scheduler.pause_prefix("pin").result() is None
+    assert pin_request.status == RequestStatus.PAUSED
+    assert not pin_future.done()
+    assert scheduler.pause_prefix("pin").result() is None
+
+    assert scheduler.resume_prefix("pin").result() is None
+    assert pin_request.status == RequestStatus.WAITING
+    assert scheduler.resume_prefix("pin").result() is None
+
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[]])
+    assert pin_future.result()["pinned_tokens"] == 8
+
+
+def test_pause_prefix_waits_for_inflight_chunk_and_preserves_kv():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=4,
+    )
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=12,
+        block_size=4,
+        req_ids=["pin-request"],
+    )
+    pin_future = scheduler.pin_prefix("pin", pin_request)
+    output = scheduler.schedule()
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(
+        pin_request.request_id
+    )
+
+    pause_future = scheduler.pause_prefix("pin")
+    assert not pause_future.done()
+    _model_output(scheduler, output, [[]])
+    assert not pause_future.done()
+
+    scheduler.schedule()
+    assert pause_future.result() is None
+    assert pin_request.status == RequestStatus.PAUSED
+    assert not pin_future.done()
+
+    scheduler.resume_prefix("pin").result()
+    assert pin_request.status == RequestStatus.PREEMPTED
+    assert (
+        scheduler.kv_cache_manager.get_block_ids(pin_request.request_id)
+        == original_block_ids
+    )
+
+    for _ in range(2):
+        output = scheduler.schedule()
+        _model_output(scheduler, output, [[]])
+
+    assert pin_future.done()
+    assert pin_future.result()["pinned_tokens"] == 12
+
+
+def test_unpin_prefix_releases_paused_request():
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=4)
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        block_size=4,
+        req_ids=["pin-request"],
+    )
+    pin_future = scheduler.pin_prefix("pin", pin_request)
+    scheduler.pause_prefix("pin").result()
+    pause_pin_id = scheduler._pause_pin_id(pin_request.request_id)
+
+    assert not scheduler.unpin_prefix("pin")
+    assert pin_request.request_id not in scheduler.requests
+    assert not scheduler.kv_cache_manager.unpin_prefix(pause_pin_id)
+    with pytest.raises(RuntimeError, match="finished before completion"):
+        pin_future.result()
+
+
+def test_pause_prefix_final_step_race_then_completed_and_unknown_are_noops():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (pin_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        block_size=4,
+        req_ids=["pin-request"],
+    )
+    pin_future = scheduler.pin_prefix("pin", pin_request)
+    output = scheduler.schedule()
+    pause_future = scheduler.pause_prefix("pin")
+    assert not pause_future.done()
+
+    _model_output(scheduler, output, [[]])
+    assert pin_future.done()
+    assert not pause_future.done()
+    scheduler.schedule()
+    assert pause_future.result() is None
+
+    assert scheduler.pause_prefix("pin").result() is None
+    assert scheduler.resume_prefix("pin").result() is None
+    assert scheduler.pause_prefix("unknown").result() is None
+    assert scheduler.resume_prefix("unknown").result() is None
+
+
 def test_cpu_pin_requires_compatible_connector():
     scheduler = create_scheduler(enable_prefix_caching=True, block_size=4)
     (pin_request,) = create_requests(
@@ -1667,6 +1786,8 @@ def test_cpu_pin_waits_for_connector_and_releases_gpu_blocks():
 
     assert not future.done()
     assert scheduler.kv_cache_manager.has_pinned_prefix("cpu-pin")
+    assert scheduler.pause_prefix("cpu-pin").result() is None
+    assert scheduler.resume_prefix("cpu-pin").result() is None
 
     connector.is_prefix_pin_ready.return_value = True
     scheduler._try_complete_cpu_prefix_pin("cpu-pin")

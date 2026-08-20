@@ -422,6 +422,14 @@ class EngineCore:
         """Resume requests while preserving their computed KV state."""
         return self.scheduler.resume_requests(request_ids)
 
+    def pause_prefix(self, pin_id: str) -> Future:
+        """Pause a pending prefix-pin request by its public pin ID."""
+        return self.scheduler.pause_prefix(pin_id)
+
+    def resume_prefix(self, pin_id: str) -> Future:
+        """Resume a paused prefix-pin request by its public pin ID."""
+        return self.scheduler.resume_prefix(pin_id)
+
     def pin_prefix(self, pin_id: str, request: EngineCoreRequest) -> Future:
         """Schedule an internal prefill-only request and pin its prefix KV."""
         if request.pin_prefix_id is not None and request.pin_prefix_id != pin_id:
