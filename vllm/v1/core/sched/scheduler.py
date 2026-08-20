@@ -1238,7 +1238,7 @@ class Scheduler(SchedulerInterface):
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
+        if total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
@@ -1289,9 +1289,9 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
-            if self.defer_block_free:
-                # Record the in-flight step, to fence deferred block freeing.
-                request.last_sched_seq = self.sched_step_seq
+            # Record the in-flight step for both strong request pauses and
+            # deferred block freeing.
+            request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -1624,11 +1624,12 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
-        # Every GPU write enqueued by this and earlier steps has completed, so it is
-        # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+        # Completing a non-empty step advances the shared in-flight fence used
+        # by strong request pauses and deferred block freeing.
+        if scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
-            self._drain_deferred_frees()
+            if self.defer_block_free:
+                self._drain_deferred_frees()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

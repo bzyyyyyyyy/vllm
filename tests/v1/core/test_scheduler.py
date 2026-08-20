@@ -1355,12 +1355,15 @@ def test_pause_waits_for_inflight_step_and_restores_same_kv_blocks():
     scheduler.add_request(request)
     output = scheduler.schedule()
     original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert request.last_sched_seq == scheduler.sched_step_seq == 1
+    assert scheduler.processed_step_seq == 0
 
     pause_future = scheduler.pause_requests([request.request_id])
     assert not pause_future.done()
     assert request.status == RequestStatus.RUNNING
 
     _model_output(scheduler, output, [[42]])
+    assert scheduler.processed_step_seq == scheduler.sched_step_seq
     assert not pause_future.done()
     scheduler.schedule()
     assert pause_future.result() is None
