@@ -414,6 +414,14 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def pause_requests(self, request_ids: list[str]) -> Future:
+        """Pause requests, acknowledging only after in-flight work is handled."""
+        return self.scheduler.pause_requests(request_ids)
+
+    def resume_requests(self, request_ids: list[str]) -> Future:
+        """Resume requests while preserving their computed KV state."""
+        return self.scheduler.resume_requests(request_ids)
+
     def pin_prefix(self, pin_id: str, request: EngineCoreRequest) -> Future:
         """Schedule an internal prefill-only request and pin its prefix KV."""
         if request.pin_prefix_id is not None and request.pin_prefix_id != pin_id:

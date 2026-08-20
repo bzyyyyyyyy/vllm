@@ -246,6 +246,12 @@ class EngineCoreClient(ABC):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    async def pause_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def resume_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -1127,6 +1133,14 @@ class AsyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    async def pause_requests_async(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            await self.call_utility_async("pause_requests", request_ids)
+
+    async def resume_requests_async(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            await self.call_utility_async("resume_requests", request_ids)
+
     async def pause_scheduler_async(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> None:
@@ -1542,6 +1556,28 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 by_engine[engine].append(req_id)
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
+
+    async def _request_control_async(
+        self, method: str, request_ids: list[str]
+    ) -> None:
+        if not request_ids or self.resources.engine_dead:
+            return
+        by_engine = defaultdict[EngineIdentity, list[str]](list)
+        for request_id in request_ids:
+            if engine := self.reqs_in_flight.get(request_id):
+                by_engine[engine].append(request_id)
+        await asyncio.gather(
+            *(
+                self._call_utility_async(method, ids, engine=engine)
+                for engine, ids in by_engine.items()
+            )
+        )
+
+    async def pause_requests_async(self, request_ids: list[str]) -> None:
+        await self._request_control_async("pause_requests", request_ids)
+
+    async def resume_requests_async(self, request_ids: list[str]) -> None:
+        await self._request_control_async("resume_requests", request_ids)
 
     async def _abort_requests(
         self, request_ids: list[str], engine: EngineIdentity

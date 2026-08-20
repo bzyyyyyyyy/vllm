@@ -588,6 +588,16 @@ class KVConnectorBase_V1(ABC):
         """
         return None
 
+    def pin_request_kv(
+        self, pin_id: str, request: "Request", num_computed_tokens: int
+    ) -> bool:
+        """Hard-pin completed request KV in connector-managed storage.
+
+        Returns False when request-pause backing is unsupported. Capacity
+        failures may be raised so the scheduler can keep the GPU pin instead.
+        """
+        return False
+
     def pin_prefix(self, pin_id: str, request: "Request") -> list[int]:
         """Atomically reserve connector storage for a hard prefix pin."""
         raise RuntimeError(

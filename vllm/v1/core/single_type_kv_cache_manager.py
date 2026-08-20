@@ -86,6 +86,7 @@ class SingleTypeKVCacheManager(ABC):
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
         self.pin_id_to_blocks: dict[str, list[KVCacheBlock]] = {}
+        self.pin_id_to_num_cached_blocks: dict[str, int | None] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -410,14 +411,28 @@ class SingleTypeKVCacheManager(ABC):
         """
         if pin_id in self.pin_id_to_blocks:
             raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        num_cached_blocks = self.num_cached_block.get(request_id)
         blocks = self.pop_blocks_for_free(request_id)
         self.pin_id_to_blocks[pin_id] = blocks
+        self.pin_id_to_num_cached_blocks[pin_id] = num_cached_blocks
+        return [block.block_id for block in blocks if not block.is_null]
+
+    def restore_request_blocks(self, pin_id: str, request_id: str) -> list[int]:
+        """Transfer pinned KV block ownership back to a request."""
+        if request_id in self.req_to_blocks:
+            raise ValueError(f"request already owns KV blocks: {request_id!r}")
+        blocks = self.pin_id_to_blocks.pop(pin_id)
+        num_cached_blocks = self.pin_id_to_num_cached_blocks.pop(pin_id, None)
+        self.req_to_blocks[request_id] = blocks
+        if num_cached_blocks is not None:
+            self.num_cached_block[request_id] = num_cached_blocks
         return [block.block_id for block in blocks if not block.is_null]
 
     def unpin_prefix(self, pin_id: str) -> bool:
         blocks = self.pin_id_to_blocks.pop(pin_id, None)
         if blocks is None:
             return False
+        self.pin_id_to_num_cached_blocks.pop(pin_id, None)
         self.block_pool.free_blocks(reversed(blocks))
         return True
 

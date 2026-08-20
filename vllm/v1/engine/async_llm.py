@@ -831,6 +831,24 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
 
+    async def pause(self, request_id: str | Iterable[str]) -> None:
+        """Pause one or more requests without closing their output streams.
+
+        The call returns after any already in-flight model step has been
+        processed and the requests' KV blocks are retained.
+        """
+        request_ids = (
+            (request_id,) if isinstance(request_id, str) else as_list(request_id)
+        )
+        await self.engine_core.pause_requests_async(list(request_ids))
+
+    async def resume(self, request_id: str | Iterable[str]) -> None:
+        """Resume one or more paused requests from their retained KV state."""
+        request_ids = (
+            (request_id,) if isinstance(request_id, str) else as_list(request_id)
+        )
+        await self.engine_core.resume_requests_async(list(request_ids))
+
     async def notify_kv_transfer_request_rejected(
         self,
         request_id: str,

@@ -345,6 +345,19 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefixes = InFlightPrefixTracker(self.block_size)
         self._prefix_reservations: dict[str, list[KVCacheBlock]] = {}
 
+        # Per-request pause state. Paused requests remain in ``self.requests``
+        # so their frontend streams stay open, but are removed from all
+        # scheduling queues. Their KV block ownership is transferred to an
+        # internal pin until resume or abort.
+        self._paused_requests: dict[str, Request] = {}
+        self._pause_pin_ids: dict[str, str] = {}
+        self._pending_pause_req_ids: set[str] = set()
+        self._pause_cpu_pin_ids: dict[str, str] = {}
+        self._pause_cpu_waiting: set[str] = set()
+        self._pause_ack_ready_ids: set[str] = set()
+        self._pause_waiters: dict[Future[None], set[str]] = {}
+        self._resume_waiters: dict[Future[None], set[str]] = {}
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -404,6 +417,10 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Complete strong pause acknowledgements only on the scheduling turn
+        # after the in-flight output was processed. This preserves output-queue
+        # ordering: the final pre-pause token is delivered before pause() returns.
+        self._flush_pause_acknowledgements()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1874,6 +1891,10 @@ class Scheduler(SchedulerInterface):
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
 
+        # A pause requested while this model step was in flight becomes safe
+        # only after all writes and sampled output from the step were handled.
+        self._finalize_pending_pauses()
+
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
@@ -2346,6 +2367,14 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            self._pending_pause_req_ids.discard(request.request_id)
+            self._pause_cpu_waiting.discard(request.request_id)
+            self._release_pause_cpu_pin(request.request_id)
+            if request.request_id in self._paused_requests:
+                self._restore_paused_request_blocks(request)
+                self._paused_requests.pop(request.request_id, None)
+            self._complete_request_operation(self._pause_waiters, request.request_id)
+            self._complete_request_operation(self._resume_waiters, request.request_id)
             delay_free_blocks = False
             self._remove_inflight_prefix_request(request.request_id)
             if request.pin_prefix_id is not None:
@@ -2375,6 +2404,194 @@ class Scheduler(SchedulerInterface):
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
         return [(r.request_id, r.client_index) for r in valid_requests]
+
+    @staticmethod
+    def _complete_request_operation(
+        operations: dict[Future[None], set[str]], request_id: str
+    ) -> None:
+        for future, pending_ids in list(operations.items()):
+            pending_ids.discard(request_id)
+            if pending_ids:
+                continue
+            operations.pop(future)
+            if not future.done():
+                future.set_result(None)
+
+    def _pause_pin_id(self, request_id: str) -> str:
+        return f"__request_pause__:{request_id}"
+
+    def _pause_cpu_pin_id(self, request_id: str) -> str:
+        return f"__request_pause_cpu__:{request_id}"
+
+    def _pause_request(self, request: Request) -> bool:
+        request_id = request.request_id
+        if request_id in self._paused_requests or request.is_finished():
+            return True
+
+        if request.status == RequestStatus.RUNNING:
+            self.running = remove_all(self.running, {request})
+        else:
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self.num_waiting_for_streaming_input -= 1
+            self.waiting.remove_requests((request,))
+            self.skipped_waiting.remove_requests((request,))
+
+        self._remove_inflight_prefix_request(request_id)
+        self._inflight_prefills.discard(request)
+        if request.num_computed_tokens:
+            self.kv_cache_manager.cache_blocks(
+                request, min(request.num_computed_tokens, request.num_tokens)
+            )
+
+        pin_id = self._pause_pin_id(request_id)
+        self.kv_cache_manager.pin_request_blocks(pin_id, request)
+        self._pause_pin_ids[request_id] = pin_id
+        self._paused_requests[request_id] = request
+        request.spec_token_ids.clear()
+        request.status = RequestStatus.PAUSED
+
+        # Prefer an additional hard CPU backing when the configured connector
+        # supports it. Any unsupported/capacity failure falls back to the GPU
+        # hard pin above, so pausing itself remains reliable.
+        if self.connector is not None and request.num_computed_tokens:
+            cpu_pin_id = self._pause_cpu_pin_id(request_id)
+            try:
+                if self.connector.pin_request_kv(
+                    cpu_pin_id, request, request.num_computed_tokens
+                ):
+                    self._pause_cpu_pin_ids[request_id] = cpu_pin_id
+                    if self.connector.is_prefix_pin_ready(cpu_pin_id):
+                        self.reset_preempted_req_ids.add(request_id)
+                        return True
+                    self._pause_cpu_waiting.add(request_id)
+                    return False
+            except Exception:
+                logger.warning(
+                    "CPU KV backing unavailable for paused request %s; "
+                    "retaining it on GPU",
+                    request_id,
+                    exc_info=True,
+                )
+                self.connector.unpin_prefix(cpu_pin_id)
+
+        # Drop worker-side request state only after any CPU store has consumed
+        # its source block table. The scheduler-side GPU pin remains retained.
+        self.reset_preempted_req_ids.add(request_id)
+        return True
+
+    def _release_pause_cpu_pin(self, request_id: str) -> None:
+        cpu_pin_id = self._pause_cpu_pin_ids.pop(request_id, None)
+        if cpu_pin_id is not None and self.connector is not None:
+            self.connector.unpin_prefix(cpu_pin_id)
+
+    def _restore_paused_request_blocks(self, request: Request) -> None:
+        pin_id = self._pause_pin_ids.pop(request.request_id, None)
+        if pin_id is not None:
+            self.kv_cache_manager.restore_request_blocks(pin_id, request)
+
+    def _resume_request(self, request: Request) -> None:
+        request_id = request.request_id
+        if request_id not in self._paused_requests:
+            return
+        self._release_pause_cpu_pin(request_id)
+        self._restore_paused_request_blocks(request)
+        self._paused_requests.pop(request_id)
+        request.spec_token_ids.clear()
+        request.status = (
+            RequestStatus.PREEMPTED
+            if request.num_computed_tokens > 0
+            else RequestStatus.WAITING
+        )
+        self.waiting.prepend_request(request)
+
+    def _finalize_pending_pauses(self) -> None:
+        for request_id in list(self._pending_pause_req_ids):
+            request = self.requests.get(request_id)
+            if request is not None and request.last_sched_seq > self.processed_step_seq:
+                continue
+            self._pending_pause_req_ids.remove(request_id)
+            if request is None or request.is_finished():
+                self._pause_ack_ready_ids.add(request_id)
+                continue
+            pause_ready = self._pause_request(request)
+            if not pause_ready:
+                continue
+            self._pause_ack_ready_ids.add(request_id)
+
+    def _flush_pause_acknowledgements(self) -> None:
+        for request_id in tuple(self._pause_ack_ready_ids):
+            self._pause_ack_ready_ids.remove(request_id)
+            self._complete_request_operation(self._pause_waiters, request_id)
+            request = self._paused_requests.get(request_id)
+            if request is not None and any(
+                request_id in ids for ids in self._resume_waiters.values()
+            ):
+                self._resume_request(request)
+            self._complete_request_operation(self._resume_waiters, request_id)
+
+    def _try_complete_paused_cpu_backing(self) -> None:
+        if self.connector is None:
+            return
+        for request_id in tuple(self._pause_cpu_waiting):
+            cpu_pin_id = self._pause_cpu_pin_ids.get(request_id)
+            if cpu_pin_id is None or not self.connector.is_prefix_pin_ready(cpu_pin_id):
+                continue
+            self._pause_cpu_waiting.remove(request_id)
+            self.reset_preempted_req_ids.add(request_id)
+            self._pause_ack_ready_ids.add(request_id)
+
+    def pause_requests(self, request_ids: list[str]) -> Future[None]:
+        """Strongly pause requests after any in-flight model step completes."""
+        future: Future[None] = Future()
+        pending_ids: set[str] = set()
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            if (
+                request is None
+                or request.is_finished()
+                or request_id in self._paused_requests
+            ):
+                continue
+            pending_ids.add(request_id)
+            if request.last_sched_seq > self.processed_step_seq:
+                self._pending_pause_req_ids.add(request_id)
+            else:
+                self._pause_request(request)
+
+        if pending_ids:
+            self._pause_waiters[future] = pending_ids
+            for request_id in tuple(pending_ids):
+                if (
+                    request_id not in self._pending_pause_req_ids
+                    and request_id not in self._pause_cpu_waiting
+                ):
+                    self._complete_request_operation(
+                        self._pause_waiters, request_id
+                    )
+        else:
+            future.set_result(None)
+        return future
+
+    def resume_requests(self, request_ids: list[str]) -> Future[None]:
+        """Resume paused requests with their original KV and token state."""
+        future: Future[None] = Future()
+        pending_ids: set[str] = set()
+        for request_id in request_ids:
+            if (
+                request_id in self._pending_pause_req_ids
+                or request_id in self._pause_cpu_waiting
+            ):
+                pending_ids.add(request_id)
+                continue
+            request = self._paused_requests.get(request_id)
+            if request is not None:
+                self._resume_request(request)
+
+        if pending_ids:
+            self._resume_waiters[future] = pending_ids
+        else:
+            future.set_result(None)
+        return future
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -2521,7 +2738,7 @@ class Scheduler(SchedulerInterface):
             + len(self.skipped_waiting)
             - self.num_waiting_for_streaming_input
         )
-        return num_waiting + len(self.running)
+        return num_waiting + len(self.running) + len(self._paused_requests)
 
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:
@@ -2531,7 +2748,10 @@ class Scheduler(SchedulerInterface):
         # Finished requests waiting on delayed connector cleanup remain in
         # self.requests after they have been removed from scheduling queues.
         num_in_queues = (
-            len(self.waiting) + len(self.skipped_waiting) + len(self.running)
+            len(self.waiting)
+            + len(self.skipped_waiting)
+            + len(self.running)
+            + len(self._paused_requests)
         )
         return len(self.requests) > num_in_queues
 
@@ -2543,7 +2763,9 @@ class Scheduler(SchedulerInterface):
         # TODO: replace with a more general mechanism for connectors to keep
         # the scheduler alive.
         return (
-            self.has_unfinished_requests()
+            bool(self.waiting or self.skipped_waiting or self.running)
+            or bool(self.reset_preempted_req_ids)
+            or bool(self._pause_ack_ready_ids)
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
         )
@@ -2872,6 +3094,7 @@ class Scheduler(SchedulerInterface):
             self.connector.update_connector_output(kv_connector_output)
             for pin_id in tuple(self._cpu_pin_waiting):
                 self._try_complete_cpu_prefix_pin(pin_id)
+            self._try_complete_paused_cpu_backing()
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

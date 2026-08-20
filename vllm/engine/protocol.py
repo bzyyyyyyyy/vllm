@@ -109,6 +109,16 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def pause(self, request_id: str | Iterable[str]) -> None:
+        """Pause requests while retaining their computed KV state."""
+        ...
+
+    @abstractmethod
+    async def resume(self, request_id: str | Iterable[str]) -> None:
+        """Resume requests from their retained KV state."""
+        ...
+
+    @abstractmethod
     async def notify_kv_transfer_request_rejected(
         self,
         request_id: str,

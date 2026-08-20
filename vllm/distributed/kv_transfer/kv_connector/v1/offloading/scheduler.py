@@ -350,6 +350,9 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # Pausing must back up decode KV too, even when normal offloading is
+        # configured as prompt-only. Values are completed-token boundaries.
+        self._forced_store_req_ids: dict[ReqId, int] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -654,10 +657,11 @@ class OffloadingConnectorScheduler:
         )
 
     def _get_prefix_pin_keys(
-        self, req_status: RequestOffloadState
+        self, req_status: RequestOffloadState, num_tokens: int | None = None
     ) -> list[OffloadKey]:
         req_status.update_offload_keys()
-        num_tokens = req_status.req.num_prompt_tokens
+        if num_tokens is None:
+            num_tokens = req_status.req.num_prompt_tokens
         keys: list[OffloadKey] = []
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
@@ -684,6 +688,21 @@ class OffloadingConnectorScheduler:
             self._get_prefix_pin_keys(req_status),
             req_status.req_context,
         )
+
+    def pin_request_kv(
+        self, pin_id: str, request: Request, num_computed_tokens: int
+    ) -> list[int]:
+        """Reserve CPU blocks and force-store all fully completed KV blocks."""
+        self.on_new_request(request)
+        req_status = self._req_status[request.request_id]
+        req_status.max_offload_tokens = None
+        block_ids = self.manager.pin_prefix(
+            pin_id,
+            self._get_prefix_pin_keys(req_status, num_computed_tokens),
+            req_status.req_context,
+        )
+        self._forced_store_req_ids[request.request_id] = num_computed_tokens
+        return block_ids
 
     def is_prefix_pin_ready(self, pin_id: str) -> bool:
         return self.manager.is_prefix_pin_ready(pin_id)
@@ -902,14 +921,22 @@ class OffloadingConnectorScheduler:
     ) -> dict[int, TransferJob]:
         block_size_factor = self.config.block_size_factor
         store_jobs: dict[int, TransferJob] = {}
-        for req_id in scheduler_output.num_scheduled_tokens:
+        request_ids = dict.fromkeys(
+            (*scheduler_output.num_scheduled_tokens, *self._forced_store_req_ids)
+        )
+        for req_id in request_ids:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
             req = req_status.req
 
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            forced_num_tokens = self._forced_store_req_ids.get(req_id)
+            num_tokens_after_batch = (
+                forced_num_tokens
+                if forced_num_tokens is not None
+                else req.num_computed_tokens + num_scheduled_tokens
+            )
             # with async scheduling, some tokens may be missing
             num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
             max_offload_tokens = req_status.max_offload_tokens
@@ -920,7 +947,7 @@ class OffloadingConnectorScheduler:
             # prefill (prompt) blocks become eligible for store. next_stored_idx
             # never advances past this boundary, so decode blocks are never
             # queued in this or any later step.
-            if self.config.offload_prompt_only:
+            if self.config.offload_prompt_only and forced_num_tokens is None:
                 num_offloadable_tokens = min(
                     num_offloadable_tokens, req.num_prompt_tokens
                 )
@@ -1077,6 +1104,7 @@ class OffloadingConnectorScheduler:
                 job_id,
             )
 
+        self._forced_store_req_ids.clear()
         return store_jobs
 
     def build_connector_meta(
@@ -1128,7 +1156,11 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            bool(self._forced_store_req_ids)
+            or bool(self._jobs)
+            or self.manager.has_pending_work()
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """

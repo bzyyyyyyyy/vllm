@@ -164,6 +164,16 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def pause_requests(self, request_ids: list[str]):
+        """Pause requests once their current in-flight step is complete."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def resume_requests(self, request_ids: list[str]):
+        """Restore paused requests to the scheduling queue."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_num_unfinished_requests(self) -> int:
         """Number of unfinished requests in the scheduler's internal queue."""
         raise NotImplementedError

@@ -339,6 +339,7 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_PREFIX = enum.auto()
     WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
+    PAUSED = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.

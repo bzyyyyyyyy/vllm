@@ -162,6 +162,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.pin_prefix(pin_id, request)
 
+    def pin_request_kv(
+        self, pin_id: str, request: Request, num_computed_tokens: int
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.pin_request_kv(
+            pin_id, request, num_computed_tokens
+        )
+        return True
+
     def is_prefix_pin_ready(self, pin_id: str) -> bool:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.is_prefix_pin_ready(pin_id)
