@@ -1653,7 +1653,9 @@ def test_pause_prefix_waits_for_inflight_chunk_and_preserves_kv():
     scheduler = create_scheduler(
         enable_prefix_caching=True,
         block_size=4,
+        max_num_seqs=1,
         max_num_batched_tokens=4,
+        max_model_len=12,
     )
     (pin_request,) = create_requests(
         num_requests=1,
