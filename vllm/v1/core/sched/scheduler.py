@@ -2857,6 +2857,10 @@ class Scheduler(SchedulerInterface):
                 request.last_sched_seq > self.processed_step_seq
                 or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
             ):
+                # Do not let an in-flight request advance its fence while the
+                # pause waits for already-scheduled work to finish.
+                if request.status == RequestStatus.RUNNING:
+                    self.running = remove_all(self.running, {request})
                 self._pending_pause_req_ids.add(request_id)
             else:
                 self._pause_request(request)
