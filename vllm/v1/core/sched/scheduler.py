@@ -695,10 +695,8 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                pause_resume_boundary = (
-                    self._pause_cpu_backed_tokens.get(request_id)
-                    if request_id in self._resuming_paused_req_ids
-                    else None
+                was_resuming_paused_request = (
+                    request_id in self._resuming_paused_req_ids
                 )
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -713,6 +711,16 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                # Promotion from WAITING_FOR_REMOTE_KVS may have completed a
+                # CPU-backed pause restore. Read the boundary only after
+                # promotion so the rest of this scheduling pass does not
+                # operate on stale pause state.
+                pause_resume_boundary = (
+                    self._pause_cpu_backed_tokens.get(request_id)
+                    if request_id in self._resuming_paused_req_ids
+                    else None
+                )
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -996,6 +1004,22 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens = min(
                             num_new_tokens,
                             max(0, pause_resume_boundary - num_computed_tokens),
+                        )
+
+                    # A live generation normally has one sampled token whose
+                    # KV has not been computed yet. A resumed pause that
+                    # violates this invariant has an invalid snapshot and must
+                    # fail explicitly instead of silently recomputing it.
+                    if (
+                        num_new_tokens <= 0
+                        and request.status == RequestStatus.PREEMPTED
+                        and was_resuming_paused_request
+                    ):
+                        raise RuntimeError(
+                            "resumed request has no token left to schedule: "
+                            f"request_id={request_id!r} "
+                            f"computed={num_computed_tokens} "
+                            f"tokens={request.num_tokens}"
                         )
 
                     # Pad new decode requests to uniform spec decoding size to
@@ -2572,22 +2596,50 @@ class Scheduler(SchedulerInterface):
         request_id = request.request_id
         if request_id not in self._resuming_paused_req_ids:
             return False
-        backed_tokens = self._pause_cpu_backed_tokens[request_id]
+        backed_tokens = self._pause_cpu_backed_tokens.get(request_id)
+        if backed_tokens is None:
+            raise RuntimeError(
+                "CPU-backed token boundary is missing for resumed request: "
+                f"request_id={request_id!r}"
+            )
         if request.num_computed_tokens < backed_tokens:
             return False
         if request.num_computed_tokens != backed_tokens:
             raise RuntimeError(
                 "resumed request advanced beyond its retained suffix boundary: "
-                f"request_id={request_id!r} computed={request.num_computed_tokens} "
+                f"request_id={request_id!r} "
+                f"computed={request.num_computed_tokens} "
                 f"boundary={backed_tokens}"
             )
 
+        original_computed_tokens = self._pause_num_computed_tokens.get(request_id)
+        if original_computed_tokens is None:
+            raise RuntimeError(
+                "original computed-token boundary is missing for resumed request: "
+                f"request_id={request_id!r}"
+            )
+
         if request_id in self._pause_tail_req_ids:
-            pin_id = self._pause_pin_ids.pop(request_id)
-            self.kv_cache_manager.restore_request_suffix(pin_id, request)
+            pin_id = self._pause_pin_ids.get(request_id)
+            if pin_id is None:
+                raise RuntimeError(
+                    "retained GPU suffix pin is missing for resumed request: "
+                    f"request_id={request_id!r}"
+                )
+            self._pause_pin_ids.pop(request_id)
+            try:
+                self.kv_cache_manager.restore_request_suffix(pin_id, request)
+            except (KeyError, ValueError) as exc:
+                # Preserve the scheduler-side pin mapping for diagnostics.
+                self._pause_pin_ids[request_id] = pin_id
+                raise RuntimeError(
+                    "retained GPU suffix could not be restored for resumed "
+                    f"request: request_id={request_id!r}"
+                ) from exc
             self._pause_tail_req_ids.remove(request_id)
 
-        request.num_computed_tokens = self._pause_num_computed_tokens.pop(request_id)
+        self._pause_num_computed_tokens.pop(request_id)
+        request.num_computed_tokens = original_computed_tokens
         self._release_pause_cpu_pin(request_id)
         self._pause_cpu_backed_tokens.pop(request_id, None)
         self._resuming_paused_req_ids.remove(request_id)
@@ -2635,6 +2687,7 @@ class Scheduler(SchedulerInterface):
                 )
             self.kv_cache_manager.free(request)
             request.num_computed_tokens = 0
+            request.num_output_placeholders = 0
             request.spec_token_ids.clear()
             request.status = RequestStatus.PAUSED
             self._resuming_paused_req_ids.remove(request_id)
@@ -2643,7 +2696,30 @@ class Scheduler(SchedulerInterface):
                 self.reset_preempted_req_ids.add(request_id)
             return True
 
-        num_computed_tokens = min(request.num_computed_tokens, request.num_tokens)
+        # AsyncScheduler counts scheduled-but-not-returned output placeholders
+        # in num_computed_tokens. A strong pause normally drains all of them,
+        # but normalize defensively so an edge-case empty/filtered output frame
+        # cannot become part of the retained KV snapshot.
+        num_output_placeholders = request.num_output_placeholders
+        num_computed_tokens = min(
+            max(request.num_computed_tokens - num_output_placeholders, 0),
+            request.num_tokens,
+        )
+        if (
+            num_output_placeholders
+            or request.num_computed_tokens != num_computed_tokens
+        ):
+            logger.warning(
+                "Normalizing async scheduler state while pausing request: "
+                "request_id=%s placeholders=%d raw_computed_tokens=%d "
+                "retained_computed_tokens=%d",
+                request_id,
+                num_output_placeholders,
+                request.num_computed_tokens,
+                num_computed_tokens,
+            )
+        request.num_computed_tokens = num_computed_tokens
+        request.num_output_placeholders = 0
         if num_computed_tokens:
             self.kv_cache_manager.cache_blocks(
                 request, num_computed_tokens
@@ -3362,17 +3438,14 @@ class Scheduler(SchedulerInterface):
                 return False
             load_failed = request.request_id in self.failed_recving_kv_req_ids
             pause_resume = request.request_id in self._resuming_paused_req_ids
+            if pause_resume and load_failed:
+                raise RuntimeError(
+                    "CPU-backed paused KV restore reached promotion with a "
+                    f"failed load: request_id={request.request_id!r}"
+                )
             self._update_waiting_for_remote_kv(request)
             if pause_resume:
-                if load_failed:
-                    # Keep the authoritative CPU/tail pins and retry lookup.
-                    # Any successfully loaded prefix blocks remain ordinary APC
-                    # entries after freeing this transient request ownership.
-                    self.kv_cache_manager.free(request)
-                    request.num_computed_tokens = 0
-                    self.reset_preempted_req_ids.add(request.request_id)
-                else:
-                    self._restore_resumed_pause_state(request)
+                self._restore_resumed_pause_state(request)
             if request.num_preemptions or pause_resume:
                 request.status = RequestStatus.PREEMPTED
             else:
@@ -3579,6 +3652,16 @@ class Scheduler(SchedulerInterface):
         total_failed_requests += len(sync_failed_req_ids)
         total_failed_tokens += num_failed_tokens
 
+        failed_pause_restore_req_ids = (
+            async_failed_req_ids | sync_failed_req_ids
+        ) & self._resuming_paused_req_ids
+        if failed_pause_restore_req_ids:
+            raise RuntimeError(
+                "CPU-backed paused KV restore failed: "
+                f"request_ids={sorted(failed_pause_restore_req_ids)} "
+                f"invalid_block_ids={sorted(invalid_block_ids)}"
+            )
+
         if not total_failed_requests:
             return set()
 
@@ -3589,23 +3672,7 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
 
         if should_fail:
-            # A resumed pause still owns an authoritative hard CPU pin. A
-            # failed copy into transient GPU blocks is therefore retryable even
-            # when ordinary connector loads use the global "fail" policy.
-            retryable_pause_req_ids = (
-                async_failed_req_ids & self._resuming_paused_req_ids
-            )
-            failed_req_ids = (
-                async_failed_req_ids - retryable_pause_req_ids
-            ) | sync_failed_req_ids
-            self.failed_recving_kv_req_ids |= retryable_pause_req_ids
-            if retryable_pause_req_ids:
-                logger.warning(
-                    "Retrying %d CPU-backed paused request(s) after KV load "
-                    "failure: %s",
-                    len(retryable_pause_req_ids),
-                    retryable_pause_req_ids,
-                )
+            failed_req_ids = async_failed_req_ids | sync_failed_req_ids
             if failed_req_ids:
                 logger.error(
                     "Failing %d request(s) due to KV load failure "

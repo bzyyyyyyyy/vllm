@@ -1360,7 +1360,9 @@ def test_pause_waits_for_inflight_step_and_restores_same_kv_blocks(
     )
     scheduler.add_request(request)
     output = scheduler.schedule()
-    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(
+        request.request_id
+    )
     assert request.last_sched_seq == scheduler.sched_step_seq == 1
     assert scheduler.processed_step_seq == 0
 
@@ -1521,7 +1523,9 @@ def test_pause_cpu_backed_prefix_can_be_evicted_and_reloaded_without_tail_recomp
     )
     scheduler.add_request(request)
     output = scheduler.schedule()
-    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(
+        request.request_id
+    )
     _model_output(scheduler, output, [[42]])
 
     connector = Mock()
@@ -1554,12 +1558,6 @@ def test_pause_cpu_backed_prefix_can_be_evicted_and_reloaded_without_tail_recomp
     assert request.request_id not in load_output.num_scheduled_tokens
     connector.unpin_prefix.assert_not_called()
 
-    # A failed CPU -> GPU copy remains retryable even under the global
-    # connector "fail" policy because the hard CPU pin is authoritative.
-    scheduler.recompute_kv_load_failures = False
-    failed_gpu_block_id = scheduler.kv_cache_manager.get_block_ids(
-        request.request_id
-    )[0][0]
     scheduler.update_from_output(
         load_output,
         ModelRunnerOutput(
@@ -1571,17 +1569,9 @@ def test_pause_cpu_backed_prefix_can_be_evicted_and_reloaded_without_tail_recomp
             pooler_output=[],
             kv_connector_output=KVConnectorOutput(
                 finished_recving=[request.request_id],
-                invalid_block_ids={failed_gpu_block_id},
             ),
         ),
     )
-    retry_load_output = scheduler.schedule()
-    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-    assert request.request_id not in retry_load_output.num_scheduled_tokens
-    assert request.request_id in scheduler.requests
-    connector.unpin_prefix.assert_not_called()
-
-    scheduler.finished_recving_kv_req_ids.add(request.request_id)
     resumed_output = scheduler.schedule()
     assert resumed_output.num_scheduled_tokens[request.request_id] == 1
     assert request.num_computed_tokens == 8
@@ -1589,6 +1579,199 @@ def test_pause_cpu_backed_prefix_can_be_evicted_and_reloaded_without_tail_recomp
     assert restored_block_ids[0][1] == tail_block_id
     connector.unpin_prefix.assert_called_once_with(
         scheduler._pause_cpu_pin_id(request.request_id)
+    )
+
+
+def test_cpu_backed_resume_kv_load_failure_raises():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-cpu-load-failure"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    _model_output(scheduler, output, [[42]])
+
+    connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.pin_request_kv.return_value = True
+    connector.is_prefix_pin_ready.return_value = True
+    connector.get_prefix_pin_error.return_value = None
+    connector.unpin_prefix.return_value = True
+    connector.get_num_new_matched_tokens.return_value = (4, True)
+    connector.update_state_after_alloc.return_value = None
+    connector.build_connector_meta.return_value = None
+    connector.get_kv_connector_stats.return_value = None
+    connector.has_pending_push_work.return_value = False
+    connector.take_events.return_value = ()
+    scheduler.connector = connector
+
+    scheduler.pause_requests([request.request_id]).result()
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    manager.block_pool.evict_blocks({original_block_ids[0][0]})
+    scheduler.resume_requests([request.request_id]).result()
+    load_output = scheduler.schedule()
+    failed_gpu_block_id = scheduler.kv_cache_manager.get_block_ids(
+        request.request_id
+    )[0][0]
+
+    scheduler.recompute_kv_load_failures = True
+    with pytest.raises(
+        RuntimeError,
+        match="CPU-backed paused KV restore failed",
+    ):
+        scheduler.update_from_output(
+            load_output,
+            ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                kv_connector_output=KVConnectorOutput(
+                    finished_recving=[request.request_id],
+                    invalid_block_ids={failed_gpu_block_id},
+                ),
+            ),
+        )
+
+    assert request.request_id in scheduler._resuming_paused_req_ids
+    connector.unpin_prefix.assert_not_called()
+
+
+def test_cpu_backed_resume_suffix_boundary_mismatch_raises():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-cpu-suffix-mismatch"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[42]])
+
+    connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.pin_request_kv.return_value = True
+    connector.is_prefix_pin_ready.return_value = True
+    connector.get_prefix_pin_error.return_value = None
+    connector.unpin_prefix.return_value = True
+    connector.get_num_new_matched_tokens.return_value = (0, False)
+    connector.update_state_after_alloc.return_value = None
+    connector.build_connector_meta.return_value = None
+    connector.get_kv_connector_stats.return_value = None
+    connector.has_pending_push_work.return_value = False
+    connector.take_events.return_value = ()
+    scheduler.connector = connector
+
+    scheduler.pause_requests([request.request_id]).result()
+    pin_id = scheduler._pause_pin_ids[request.request_id]
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    manager.pin_id_to_suffix_start_block[pin_id] += 1
+    scheduler.resume_requests([request.request_id]).result()
+
+    with pytest.raises(
+        RuntimeError,
+        match="retained GPU suffix could not be restored",
+    ):
+        scheduler.schedule()
+
+    assert scheduler._pause_pin_ids[request.request_id] == pin_id
+    assert request.request_id in scheduler._resuming_paused_req_ids
+    connector.unpin_prefix.assert_not_called()
+
+
+def test_cpu_backed_resume_missing_boundary_raises():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-cpu-missing-boundary"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    _model_output(scheduler, output, [[42]])
+
+    connector = Mock()
+    connector.get_prefix_pin_alignment.return_value = 4
+    connector.pin_request_kv.return_value = True
+    connector.is_prefix_pin_ready.return_value = True
+    connector.get_prefix_pin_error.return_value = None
+    connector.unpin_prefix.return_value = True
+    connector.get_num_new_matched_tokens.return_value = (0, False)
+    connector.update_state_after_alloc.return_value = None
+    connector.build_connector_meta.return_value = None
+    connector.get_kv_connector_stats.return_value = None
+    connector.has_pending_push_work.return_value = False
+    connector.take_events.return_value = ()
+    scheduler.connector = connector
+
+    scheduler.pause_requests([request.request_id]).result()
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    manager.block_pool.evict_blocks({original_block_ids[0][0]})
+    scheduler.resume_requests([request.request_id]).result()
+
+    with pytest.raises(
+        RuntimeError,
+        match="CPU pause backing did not cover its exact restore boundary",
+    ):
+        scheduler.schedule()
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert request.request_id in scheduler._resuming_paused_req_ids
+    assert request.request_id in scheduler._pause_cpu_backed_tokens
+    assert request.request_id in scheduler._pause_tail_req_ids
+    connector.unpin_prefix.assert_not_called()
+
+
+def test_pause_normalizes_residual_async_output_placeholders():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=32,
+        async_scheduling=True,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=7,
+        block_size=4,
+        req_ids=["pause-async-placeholder"],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[42]])
+
+    request.num_computed_tokens += 1
+    request.num_output_placeholders = 1
+    retained_computed_tokens = request.num_computed_tokens - 1
+
+    scheduler.pause_requests([request.request_id]).result()
+
+    assert request.num_output_placeholders == 0
+    assert request.num_computed_tokens == retained_computed_tokens
+    assert (
+        scheduler._pause_num_computed_tokens[request.request_id]
+        == retained_computed_tokens
     )
 
 
