@@ -447,6 +447,17 @@ class OutputProcessor:
             assert state.queue is not None
             state.queue.put(e)
 
+    def get_internal_request_ids(self, request_ids: Iterable[str]) -> list[str]:
+        """Resolve external request IDs without modifying request state."""
+        internal_request_ids: list[str] = []
+        seen_request_ids: set[str] = set()
+        for request_id in request_ids:
+            for internal_request_id in self.external_req_ids.get(request_id, ()):
+                if internal_request_id not in seen_request_ids:
+                    internal_request_ids.append(internal_request_id)
+                    seen_request_ids.add(internal_request_id)
+        return internal_request_ids
+
     def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
         """Abort a list of requests.
 

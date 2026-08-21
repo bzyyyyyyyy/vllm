@@ -3,6 +3,8 @@
 
 import math
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -26,6 +28,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
@@ -1342,3 +1345,77 @@ def test_abort_requests(runner: str, abort_by: str, dummy_test_vectors):
             output_processor.abort_requests([request.request_id], internal=True)
         else:
             output_processor.abort_requests([request.external_req_id], internal=False)
+
+
+def test_get_internal_request_ids_is_non_destructive(dummy_test_vectors):
+    output_processor = OutputProcessor(dummy_test_vectors.tokenizer, log_stats=False)
+    requests = [
+        EngineCoreRequest(
+            request_id=f"request-{idx}",
+            external_req_id="external-shared" if idx < 2 else "external-other",
+            prompt_token_ids=[0],
+            mm_features=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+        )
+        for idx in range(3)
+    ]
+    for request in requests:
+        queue = RequestOutputCollector(
+            output_kind=RequestOutputKind.CUMULATIVE,
+            request_id=request.request_id,
+        )
+        output_processor.add_request(request, None, queue=queue)
+
+    resolved = output_processor.get_internal_request_ids(
+        ["external-shared", "unknown", "external-shared", "external-other"]
+    )
+
+    assert resolved == ["request-0", "request-1", "request-2"]
+    assert set(output_processor.request_states) == {
+        "request-0",
+        "request-1",
+        "request-2",
+    }
+    assert output_processor.external_req_ids == {
+        "external-shared": ["request-0", "request-1"],
+        "external-other": ["request-2"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_resolve_external_request_ids():
+    output_processor = Mock()
+    output_processor.get_internal_request_ids.side_effect = [
+        ["internal-0", "internal-1"],
+        ["internal-0", "internal-1"],
+        [],
+    ]
+    engine_core = SimpleNamespace(
+        pause_requests_async=AsyncMock(),
+        resume_requests_async=AsyncMock(),
+    )
+    engine = SimpleNamespace(
+        output_processor=output_processor,
+        engine_core=engine_core,
+    )
+
+    await AsyncLLM.pause(engine, "external")
+    await AsyncLLM.resume(engine, ["external"])
+    await AsyncLLM.pause(engine, "unknown")
+
+    assert output_processor.get_internal_request_ids.call_args_list == [
+        call(("external",)),
+        call(["external"]),
+        call(("unknown",)),
+    ]
+    engine_core.pause_requests_async.assert_awaited_once_with(
+        ["internal-0", "internal-1"]
+    )
+    engine_core.resume_requests_async.assert_awaited_once_with(
+        ["internal-0", "internal-1"]
+    )
