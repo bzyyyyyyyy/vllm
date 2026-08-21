@@ -1347,8 +1347,8 @@ def test_abort_requests(runner: str, abort_by: str, dummy_test_vectors):
             output_processor.abort_requests([request.external_req_id], internal=False)
 
 
-def test_get_internal_request_ids_is_non_destructive(dummy_test_vectors):
-    output_processor = OutputProcessor(dummy_test_vectors.tokenizer, log_stats=False)
+def test_get_internal_request_ids_is_non_destructive():
+    output_processor = OutputProcessor(None, log_stats=False)
     requests = [
         EngineCoreRequest(
             request_id=f"request-{idx}",
@@ -1359,14 +1359,14 @@ def test_get_internal_request_ids_is_non_destructive(dummy_test_vectors):
             lora_request=None,
             cache_salt=None,
             data_parallel_rank=None,
-            sampling_params=SamplingParams(),
-            pooling_params=None,
+            sampling_params=None,
+            pooling_params=PoolingParams(task="embed"),
         )
         for idx in range(3)
     ]
     for request in requests:
         queue = RequestOutputCollector(
-            output_kind=RequestOutputKind.CUMULATIVE,
+            output_kind=RequestOutputKind.FINAL_ONLY,
             request_id=request.request_id,
         )
         output_processor.add_request(request, None, queue=queue)
