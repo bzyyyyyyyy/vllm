@@ -4,13 +4,14 @@ import asyncio
 import contextlib
 import queue
 import sys
+import threading
 import uuid
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
 from threading import Thread
@@ -46,7 +47,7 @@ from vllm.v1.engine import (
     UtilityOutput,
 )
 from vllm.v1.engine.coordinator import DPCoordinator
-from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.core import EngineCore, EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
@@ -55,7 +56,7 @@ from vllm.v1.engine.utils import (
     get_engine_zmq_addresses,
     launch_core_engines,
 )
-from vllm.v1.executor import Executor
+from vllm.v1.executor import Executor, UniProcExecutor
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -68,6 +69,50 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 EngineIdentity = bytes
 
 
+def _copy_exception_without_traceback(error: Exception) -> Exception:
+    """Copy an exception without retaining owner-thread frames or GPU objects."""
+    builtins_module = sys.modules["builtins"]
+    base_exception_group_type = getattr(
+        builtins_module, "BaseExceptionGroup", None
+    )
+    if base_exception_group_type is not None and isinstance(
+        error, base_exception_group_type
+    ):
+        nested = [
+            _copy_exception_without_traceback(exc)
+            if isinstance(exc, Exception)
+            else RuntimeError(f"{type(exc).__name__}: {exc}")
+            for exc in error.exceptions
+        ]
+        exception_group_type = getattr(builtins_module, "ExceptionGroup")
+        detached = exception_group_type(
+            getattr(error, "message", str(error)), nested
+        )
+        assert isinstance(detached, Exception)
+    else:
+        safe_arg_types = (str, bytes, int, float, bool, type(None))
+        safe_args = all(isinstance(arg, safe_arg_types) for arg in error.args)
+        try:
+            # Common Python, PyTorch, and vLLM exceptions carry only scalar
+            # args. Do not copy __dict__: custom attributes may own tensors.
+            detached = (
+                type(error)(*error.args)
+                if safe_args
+                else type(error)(str(error))
+            )
+        except Exception:
+            detached = RuntimeError(f"{type(error).__name__}: {error}")
+
+    add_note = getattr(detached, "add_note", None)
+    if add_note is not None and not getattr(detached, "__notes__", None):
+        for note in getattr(error, "__notes__", ()):
+            add_note(note)
+    detached.__traceback__ = None
+    detached.__cause__ = None
+    detached.__context__ = None
+    return detached
+
+
 class EngineCoreClient(ABC):
     """
     EngineCoreClient: subclasses handle different methods for pushing
@@ -77,7 +122,13 @@ class EngineCoreClient(ABC):
     * InprocClient: In process EngineCore (for V0-style LLMEngine use)
     * SyncMPClient: ZMQ + background proc EngineCore (for LLM)
     * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
+    * AsyncInprocClient: owner-thread EngineCore w/ asyncio (for AsyncLLM)
     """
+
+    resources: Any
+    engine_ranks_managed: list[int]
+    core_engines: list[EngineIdentity]
+    core_engine: EngineIdentity
 
     @staticmethod
     def make_client(
@@ -86,21 +137,32 @@ class EngineCoreClient(ABC):
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
     ) -> "EngineCoreClient":
-        # TODO: support this for debugging purposes.
-        if asyncio_mode and not multiprocess_mode:
-            raise NotImplementedError(
-                "Running EngineCore in asyncio without multiprocessing "
-                "is not currently supported."
-            )
-
         if multiprocess_mode and asyncio_mode:
             return EngineCoreClient.make_async_mp_client(
-                vllm_config, executor_class, log_stats
+                vllm_config,
+                executor_class,
+                log_stats,
+                client_addresses,
+                client_count,
+                client_index,
             )
 
         if multiprocess_mode and not asyncio_mode:
             return SyncMPClient(vllm_config, executor_class, log_stats)
+
+        if asyncio_mode:
+            return AsyncInprocClient(
+                vllm_config,
+                executor_class,
+                log_stats,
+                client_addresses,
+                client_count,
+                client_index,
+            )
 
         return InprocClient(vllm_config, executor_class, log_stats)
 
@@ -212,6 +274,9 @@ class EngineCoreClient(ABC):
     async def get_output_async(self) -> EngineCoreOutputs:
         raise NotImplementedError
 
+    async def call_utility_async(self, method: str, *args) -> Any:
+        raise NotImplementedError
+
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
@@ -250,6 +315,17 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def resume_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        raise NotImplementedError
+
+    async def resume_scheduler_async(self) -> None:
+        raise NotImplementedError
+
+    async def is_scheduler_paused_async(self) -> bool:
         raise NotImplementedError
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
@@ -461,6 +537,438 @@ class BackgroundResources:
         if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
             self.engine_dead = True
             raise EngineDeadError()
+
+
+@dataclass
+class InprocBackgroundResources:
+    """Resources owned by :class:`AsyncInprocClient`'s EngineCore thread.
+
+    This object deliberately has no reference back to the client. It is used by
+    ``weakref.finalize`` so an abandoned client can still wake and join its
+    owner thread without creating a client/thread reference cycle.
+    """
+
+    startup_future: Future[None] = field(default_factory=Future)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    outputs_queue: asyncio.Queue[EngineCoreOutputs | Exception] = field(
+        default_factory=asyncio.Queue
+    )
+    pending_outputs: deque[EngineCoreOutputs | Exception] = field(
+        default_factory=deque
+    )
+    utility_results: dict[int, asyncio.Future[Any]] = field(default_factory=dict)
+    thread: Thread | None = None
+    engine_core: "_AsyncInprocEngineCore | None" = None
+    loop: asyncio.AbstractEventLoop | None = None
+    fatal_error: Exception | None = None
+    teardown_error: Exception | None = None
+    engine_dead: bool = False
+    closing: bool = False
+    stopped: bool = False
+    terminal_output_published: bool = False
+    terminal_output_delivered: bool = False
+
+    @staticmethod
+    def _dead_error(cause: Exception | None = None) -> EngineDeadError:
+        error = EngineDeadError(suppress_context=True)
+        if cause is not None:
+            error.__cause__ = cause
+        return error
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the bridge lazily to the first asyncio loop using the client."""
+        with self.lock:
+            if self.loop is not None and self.loop is not loop:
+                raise RuntimeError(
+                    "AsyncInprocClient cannot be used from multiple asyncio loops"
+                )
+            if self.loop is loop:
+                return
+            self.loop = loop
+            pending = tuple(self.pending_outputs)
+            self.pending_outputs.clear()
+
+        # We are already executing on ``loop`` here. Deliver pending owner-thread
+        # outputs synchronously so later call_soon_threadsafe deliveries cannot
+        # overtake them.
+        for output in pending:
+            self._deliver_output(output)
+
+    def ensure_alive(self) -> "_AsyncInprocEngineCore":
+        with self.lock:
+            engine_core = self.engine_core
+            cause = self.fatal_error
+            unavailable = self.engine_dead or self.closing or engine_core is None
+        if unavailable:
+            raise self._dead_error(cause)
+        assert engine_core is not None
+        return engine_core
+
+    def register_utility(
+        self, call_id: int, future: asyncio.Future[Any]
+    ) -> None:
+        with self.lock:
+            if self.engine_dead or self.closing or self.engine_core is None:
+                raise self._dead_error(self.fatal_error)
+            self.utility_results[call_id] = future
+
+    def discard_utility(self, call_id: int) -> None:
+        with self.lock:
+            self.utility_results.pop(call_id, None)
+
+    def enqueue(self, request_type: EngineCoreRequestType, request: Any) -> None:
+        # Holding the state lock across put_nowait closes the race with shutdown:
+        # every accepted command is ordered before the shutdown wakeup.
+        with self.lock:
+            if self.engine_dead or self.closing or self.engine_core is None:
+                raise self._dead_error(self.fatal_error)
+            self.engine_core.input_queue.put_nowait((request_type, request))
+
+    def enqueue_abort(self, request_ids: list[str]) -> None:
+        # Mirror EngineCoreProc.process_input_sockets: eager aborts are visible
+        # to an in-flight GPU step, while the regular input queue preserves FIFO
+        # ordering and prevents an add/abort race from leaking a request.
+        with self.lock:
+            if self.engine_dead or self.closing or self.engine_core is None:
+                raise self._dead_error(self.fatal_error)
+            self.engine_core.aborts_queue.put_nowait(request_ids)
+            self.engine_core.input_queue.put_nowait(
+                (EngineCoreRequestType.ABORT, request_ids)
+            )
+
+    def publish_output(self, outputs: EngineCoreOutputs) -> None:
+        with self.lock:
+            if self.stopped:
+                return
+            loop = self.loop
+            if loop is None:
+                self.pending_outputs.append(outputs)
+                return
+
+        if loop.is_closed():
+            return
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(self._deliver_output, outputs)
+
+    def _deliver_output(self, outputs: EngineCoreOutputs | Exception) -> None:
+        if isinstance(outputs, Exception):
+            with self.lock:
+                self.terminal_output_delivered = True
+            self.outputs_queue.put_nowait(outputs)
+            self._fail_utility_waiters(outputs)
+            return
+
+        if outputs.utility_output is not None:
+            call_id = outputs.utility_output.call_id
+            with self.lock:
+                future = self.utility_results.pop(call_id, None)
+            if future is None:
+                # A normal late result after shutdown, or a result whose caller
+                # was already failed by a fatal EngineCore error.
+                return
+            _process_utility_output(outputs.utility_output, {call_id: future})
+            return
+
+        # Match AsyncMPClient: wave-only/control messages are handled by DP
+        # clients, which AsyncInprocClient intentionally does not support.
+        if outputs.outputs or outputs.scheduler_stats:
+            self.outputs_queue.put_nowait(outputs)
+
+    def attach_engine(self, engine_core: "_AsyncInprocEngineCore") -> None:
+        with self.lock:
+            self.engine_core = engine_core
+            should_stop = self.closing
+        if should_stop:
+            engine_core.shutdown_state = EngineShutdownState.REQUESTED
+            engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def mark_fatal(self, error: Exception) -> None:
+        with self.lock:
+            if self.fatal_error is None:
+                self.fatal_error = _copy_exception_without_traceback(error)
+            self.engine_dead = True
+        self._publish_terminal_output()
+
+    def _publish_terminal_output(self) -> None:
+        """Publish one ordered terminal marker to the asyncio consumer."""
+        with self.lock:
+            if self.terminal_output_published:
+                return
+            self.terminal_output_published = True
+            error = self._dead_error(self.fatal_error)
+            loop = self.loop
+            if loop is None:
+                self.pending_outputs.append(error)
+                return
+        if not loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._deliver_output, error)
+
+    def _fail_utility_waiters(self, error: Exception) -> None:
+        with self.lock:
+            futures = tuple(self.utility_results.values())
+            self.utility_results.clear()
+        for future in futures:
+            if not future.done():
+                future.set_exception(error)
+
+    def request_shutdown(self) -> None:
+        with self.lock:
+            if self.closing:
+                return
+            self.closing = True
+            # Keep the same observable post-shutdown state as BackgroundResources.
+            self.engine_dead = True
+            engine_core = self.engine_core
+        if engine_core is not None:
+            engine_core.shutdown_state = EngineShutdownState.REQUESTED
+            engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def mark_stopped(self) -> None:
+        with self.lock:
+            self.stopped = True
+            self.engine_core = None
+        # Wake an already-blocked output consumer on normal shutdown. Fatal
+        # paths publish the same marker earlier, and this call is then a no-op.
+        self._publish_terminal_output()
+
+    def shutdown(
+        self, timeout: float | None = None, *, raise_on_error: bool = True
+    ) -> None:
+        self.request_shutdown()
+        thread = self.thread
+        if thread is None:
+            return
+        if thread is threading.current_thread():
+            return
+
+        join_timeout = (
+            envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+            if timeout is None
+            else timeout
+        )
+        thread.join(timeout=join_timeout)
+        if thread.is_alive():
+            message = (
+                "AsyncInprocClient owner thread did not stop within "
+                f"{join_timeout}s; an in-process CUDA/NCCL call may be stuck"
+            )
+            if raise_on_error:
+                raise TimeoutError(message)
+            logger.error(message)
+            return
+
+        if self.teardown_error is not None and raise_on_error:
+            raise self.teardown_error
+
+    def __call__(self) -> None:
+        """Best-effort finalizer entry point."""
+        logger.debug_once(
+            "[shutdown] AsyncInprocClient: background resource cleanup start"
+        )
+        try:
+            self.shutdown(raise_on_error=False)
+        except Exception:
+            logger.exception(
+                "[shutdown] AsyncInprocClient: background resource cleanup failed"
+            )
+        logger.debug_once(
+            "[shutdown] AsyncInprocClient: background resource cleanup complete"
+        )
+
+
+class _InprocEngineOutputQueue:
+    """Queue-shaped output adapter used by the shared EngineCoreProc loop."""
+
+    def __init__(self, resources: InprocBackgroundResources):
+        self.resources = resources
+
+    def put_nowait(self, item: tuple[int, EngineCoreOutputs] | bytes) -> None:
+        if isinstance(item, bytes):
+            self.resources.mark_fatal(RuntimeError("EngineCore exited unexpectedly"))
+            return
+        client_index, outputs = item
+        if client_index != 0:
+            self.resources.mark_fatal(
+                RuntimeError(
+                    "AsyncInprocClient received output for unsupported "
+                    f"client_index={client_index}"
+                )
+            )
+            return
+        self.resources.publish_output(outputs)
+
+
+class _AsyncInprocEngineCore(EngineCoreProc):
+    """EngineCoreProc busy-loop semantics without process or ZMQ resources."""
+
+    def __init__(
+        self,
+        resources: InprocBackgroundResources,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+    ) -> None:
+        self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+        self.output_queue = _InprocEngineOutputQueue(
+            resources
+        )  # type: ignore[assignment]
+
+        def executor_fail_callback() -> None:
+            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
+
+        self.engine_index = 0
+        self.engines_running = False
+        self.shutdown_state = EngineShutdownState.RUNNING
+        self.has_coordinator = False
+        self.publish_dp_lb_stats = False
+        self.process_input_queue_block = True
+        self.tensor_ipc_receiver = None
+
+        # Deliberately bypass EngineCoreProc.__init__: the owner thread itself
+        # replaces the process boundary and its ZMQ input/output threads.
+        EngineCore.__init__(
+            self,
+            vllm_config,
+            executor_class,
+            log_stats,
+            executor_fail_callback,
+            include_finished_set=False,
+        )
+
+    def _handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        if request_type == EngineCoreRequestType.ADD and isinstance(
+            request, EngineCoreRequest
+        ):
+            raw_request = request
+            try:
+                request = self.preprocess_add_request(request)
+            except Exception:
+                # Keep malformed/add preprocessing failures request-scoped just
+                # like EngineCoreProc.process_input_sockets.
+                self._handle_request_preproc_error(raw_request)
+                return
+        super()._handle_client_request(request_type, request)
+
+    def _cleanup_compiled_model_hooks(self) -> None:
+        """Drop global bytecode hooks before the executor releases its model."""
+        model_executor = getattr(self, "model_executor", None)
+        driver_worker = getattr(model_executor, "driver_worker", None)
+        model_runner = getattr(driver_worker, "model_runner", None)
+        model = getattr(model_runner, "model", None)
+        if model is None:
+            return
+
+        from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+        for module in model.modules():
+            if isinstance(module, TorchCompileWithNoGuardsWrapper):
+                module.cleanup()
+
+    def shutdown(self) -> None:
+        hook_error: Exception | None = None
+        try:
+            self._cleanup_compiled_model_hooks()
+        except Exception as error:
+            logger.exception("AsyncInprocClient failed to clean compiled model hooks")
+            hook_error = _copy_exception_without_traceback(error)
+
+        # Always release executor, scheduler, distributed, and CUDA resources,
+        # even if a compile-wrapper hook failed to clean itself up.
+        super().shutdown()
+        if hook_error is not None:
+            raise hook_error
+
+
+def _run_async_inproc_engine(
+    resources: InprocBackgroundResources,
+    vllm_config: VllmConfig,
+    executor_class: type[Executor],
+    log_stats: bool,
+) -> None:
+    """Construct, drive, and tear down EngineCore on its fixed owner thread."""
+    engine_core = _AsyncInprocEngineCore.__new__(_AsyncInprocEngineCore)
+    startup_complete = False
+    primary_error: Exception | None = None
+
+    def normalize_error(exc: BaseException, message: str) -> Exception:
+        if isinstance(exc, Exception):
+            return exc
+        normalized = RuntimeError(message)
+        normalized.__cause__ = exc
+        return normalized
+
+    try:
+        engine_core.__init__(resources, vllm_config, executor_class, log_stats)
+        resources.attach_engine(engine_core)
+        resources.startup_future.set_result(None)
+        startup_complete = True
+        engine_core.run_busy_loop()
+        busy_loop_error = RuntimeError(
+            "AsyncInprocClient EngineCore busy loop returned unexpectedly"
+        )
+        primary_error = busy_loop_error
+        resources.mark_fatal(busy_loop_error)
+    except SystemExit as error:
+        # EngineCoreProc.run_busy_loop uses SystemExit for its normal shutdown.
+        if not startup_complete:
+            startup_error = normalize_error(
+                error, "AsyncInprocClient EngineCore exited during startup"
+            )
+            primary_error = startup_error
+            resources.mark_fatal(startup_error)
+        elif not resources.closing:
+            unexpected_exit_error = RuntimeError(
+                "AsyncInprocClient EngineCore exited unexpectedly"
+            )
+            primary_error = unexpected_exit_error
+            resources.mark_fatal(unexpected_exit_error)
+    except BaseException as error:
+        fatal_error = normalize_error(
+            error,
+            "AsyncInprocClient EngineCore was interrupted by a fatal base exception",
+        )
+        primary_error = fatal_error
+        if not startup_complete and not resources.startup_future.done():
+            resources.startup_future.set_exception(
+                _copy_exception_without_traceback(fatal_error)
+            )
+        resources.mark_fatal(fatal_error)
+        logger.exception(
+            "AsyncInprocClient EngineCore %s.",
+            "failed to start" if not startup_complete else "encountered a fatal error",
+        )
+    finally:
+        try:
+            engine_core.shutdown()
+        except BaseException as error:
+            cleanup_error = normalize_error(
+                error, "AsyncInprocClient EngineCore teardown was interrupted"
+            )
+            if primary_error is None:
+                primary_error = cleanup_error
+                resources.teardown_error = _copy_exception_without_traceback(
+                    cleanup_error
+                )
+                resources.mark_fatal(cleanup_error)
+            logger.exception("AsyncInprocClient EngineCore teardown failed")
+        finally:
+            # No constructor path may leave the ready waiter unresolved. Preserve
+            # the original startup failure even when best-effort teardown also
+            # fails so callers see the actual root cause.
+            if not startup_complete and not resources.startup_future.done():
+                resources.startup_future.set_exception(
+                    _copy_exception_without_traceback(
+                        primary_error
+                        or RuntimeError(
+                            "AsyncInprocClient EngineCore stopped before startup "
+                            "completed"
+                        )
+                    )
+                )
+            resources.mark_stopped()
 
 
 @dataclass
@@ -782,6 +1290,267 @@ def _process_utility_output(
             )
 
 
+class _AsyncClientUtilityMixin:
+    """Utility proxies shared by the MP and owner-thread async clients."""
+
+    resources: Any
+
+    async def call_utility_async(self, method: str, *args) -> Any:
+        raise NotImplementedError
+
+    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        return await self.call_utility_async("get_supported_tasks")
+
+    async def pause_requests_async(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            await self.call_utility_async("pause_requests", request_ids)
+
+    async def resume_requests_async(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            await self.call_utility_async("resume_requests", request_ids)
+
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        await self.call_utility_async("pause_scheduler", mode, clear_cache)
+
+    async def resume_scheduler_async(self) -> None:
+        await self.call_utility_async("resume_scheduler")
+
+    async def is_scheduler_paused_async(self) -> bool:
+        return await self.call_utility_async("is_scheduler_paused")
+
+    async def profile_async(
+        self, is_start: bool = True, profile_prefix: str | None = None
+    ) -> None:
+        await self.call_utility_async("profile", is_start, profile_prefix)
+
+    async def reset_mm_cache_async(self) -> None:
+        await self.call_utility_async("reset_mm_cache")
+
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        return await self.call_utility_async(
+            "reset_prefix_cache", reset_running_requests, reset_connector
+        )
+
+    async def reset_encoder_cache_async(self) -> None:
+        await self.call_utility_async("reset_encoder_cache")
+
+    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        await self.call_utility_async("sleep", level, mode)
+
+    async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        await self.call_utility_async("wake_up", tags)
+
+    async def is_sleeping_async(self) -> bool:
+        return await self.call_utility_async("is_sleeping")
+
+    async def execute_dummy_batch_async(self) -> None:
+        await self.call_utility_async("execute_dummy_batch")
+
+    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
+        return await self.call_utility_async("add_lora", lora_request)
+
+    async def remove_lora_async(self, lora_id: int) -> bool:
+        return await self.call_utility_async("remove_lora", lora_id)
+
+    async def list_loras_async(self) -> set[int]:
+        return await self.call_utility_async("list_loras")
+
+    async def pin_lora_async(self, lora_id: int) -> bool:
+        return await self.call_utility_async("pin_lora", lora_id)
+
+    async def save_sharded_state_async(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        await self.call_utility_async("save_sharded_state", path, pattern, max_size)
+
+    async def collective_rpc_async(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        return await self.call_utility_async(
+            "collective_rpc", method, timeout, args, kwargs
+        )
+
+
+class AsyncInprocClient(_AsyncClientUtilityMixin, EngineCoreClient):
+    """Asyncio client with EngineCore hosted by a fixed thread in this process.
+
+    EngineCore and all of its scheduler/executor operations are owned by one
+    thread. Async callers only enqueue commands and receive outputs through the
+    thread-safe bridge in :class:`InprocBackgroundResources`.
+    """
+
+    resources: InprocBackgroundResources
+
+    @instrument(span_name="AsyncInprocClient init")
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+    ) -> None:
+        self._validate_config(
+            vllm_config,
+            executor_class,
+            client_addresses,
+            client_count,
+            client_index,
+        )
+
+        self.vllm_config = vllm_config
+        self.client_count = client_count
+        self.client_index = client_index
+        self.engine_ranks_managed = [0]
+        self.core_engines = [int(0).to_bytes(2, "little")]
+        self.core_engine = self.core_engines[0]
+        self.engines_running = False
+
+        resources = self.resources = InprocBackgroundResources()
+        self.outputs_queue = resources.outputs_queue
+        self.utility_results = resources.utility_results
+        self._finalizer = weakref.finalize(self, resources)
+
+        thread = Thread(
+            target=_run_async_inproc_engine,
+            args=(resources, vllm_config, executor_class, log_stats),
+            daemon=True,
+            name="AsyncInprocEngineCore",
+        )
+        resources.thread = thread
+        thread.start()
+
+        try:
+            resources.startup_future.result(timeout=VLLM_ENGINE_READY_TIMEOUT_S)
+        except TimeoutError as error:
+            self._finalizer()
+            raise TimeoutError(
+                "Timed out waiting for AsyncInprocClient EngineCore thread to "
+                f"start after {VLLM_ENGINE_READY_TIMEOUT_S}s"
+            ) from error
+        except Exception:
+            self._finalizer()
+            raise
+
+    @staticmethod
+    def _validate_config(
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        client_addresses: dict[str, Any] | None,
+        client_count: int,
+        client_index: int,
+    ) -> None:
+        unsupported: list[str] = []
+        if client_addresses is not None:
+            unsupported.append("client_addresses")
+        if client_count != 1:
+            unsupported.append(f"client_count={client_count}")
+        if client_index != 0:
+            unsupported.append(f"client_index={client_index}")
+
+        parallel_config = vllm_config.parallel_config
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "data_parallel_size_local",
+        ):
+            value = getattr(parallel_config, name)
+            if value != 1:
+                unsupported.append(f"{name}={value}")
+        if getattr(parallel_config, "enable_elastic_ep", False):
+            unsupported.append("enable_elastic_ep=True")
+        if not (
+            isinstance(executor_class, type)
+            and issubclass(executor_class, UniProcExecutor)
+        ):
+            name = getattr(executor_class, "__name__", repr(executor_class))
+            unsupported.append(f"executor_class={name}")
+
+        if unsupported:
+            details = ", ".join(unsupported)
+            raise ValueError(
+                "AsyncInprocClient only supports a single local client with "
+                "TP=PP=DP=1 and UniProcExecutor; unsupported: " + details
+            )
+
+    def _bind_loop(self) -> None:
+        self.resources.bind_loop(asyncio.get_running_loop())
+
+    def ensure_alive(self) -> None:
+        self.resources.ensure_alive()
+
+    def _format_exception(self, error: Exception) -> Exception:
+        if self.resources.engine_dead:
+            return self.resources._dead_error(self.resources.fatal_error)
+        return error
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        timeout_str = "default" if timeout is None else f"{timeout}s"
+        logger.info("[shutdown] AsyncInprocClient: start timeout=%s", timeout_str)
+        self.resources.shutdown(timeout=timeout)
+        if self._finalizer.alive:
+            self._finalizer.detach()
+        logger.info_once("[shutdown] AsyncInprocClient: complete")
+
+    async def get_output_async(self) -> EngineCoreOutputs:
+        self._bind_loop()
+        if self.resources.terminal_output_delivered and self.outputs_queue.empty():
+            raise self.resources._dead_error(self.resources.fatal_error)
+        outputs = await self.outputs_queue.get()
+        if isinstance(outputs, Exception):
+            raise self._format_exception(outputs) from None
+        return outputs
+
+    async def call_utility_async(self, method: str, *args) -> Any:
+        self._bind_loop()
+        self.ensure_alive()
+        call_id = uuid.uuid1().int >> 64
+        future = asyncio.get_running_loop().create_future()
+        self.resources.register_utility(call_id, future)
+        try:
+            self.resources.enqueue(
+                EngineCoreRequestType.UTILITY,
+                (self.client_index, call_id, method, args),
+            )
+        except Exception:
+            self.resources.discard_utility(call_id)
+            future.cancel()
+            raise
+        return await future
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        self._bind_loop()
+        request.client_index = self.client_index
+        self.resources.enqueue(EngineCoreRequestType.ADD, request)
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        self._bind_loop()
+        if not request_ids or self.resources.engine_dead:
+            return
+        try:
+            self.resources.enqueue_abort(request_ids)
+        except EngineDeadError:
+            # Match AsyncMPClient's best-effort abort behavior during teardown.
+            if not self.resources.engine_dead:
+                raise
+
+    def dp_engines_running(self) -> bool:
+        return False
+
+    async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
+        raise ValueError("AsyncInprocClient does not support elastic EP scaling")
+
+
 class SyncMPClient(MPClient):
     """Synchronous client for multi-proc EngineCore."""
 
@@ -953,8 +1722,10 @@ class SyncMPClient(MPClient):
         self.call_utility("save_sharded_state", path, pattern, max_size)
 
 
-class AsyncMPClient(MPClient):
+class AsyncMPClient(_AsyncClientUtilityMixin, MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
+
+    resources: BackgroundResources
 
     @instrument(span_name="AsyncMPClient init")
     def __init__(
@@ -1121,9 +1892,6 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
         return await future
 
-    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
-        return await self.call_utility_async("get_supported_tasks")
-
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
@@ -1132,83 +1900,6 @@ class AsyncMPClient(MPClient):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
-
-    async def pause_requests_async(self, request_ids: list[str]) -> None:
-        if request_ids and not self.resources.engine_dead:
-            await self.call_utility_async("pause_requests", request_ids)
-
-    async def resume_requests_async(self, request_ids: list[str]) -> None:
-        if request_ids and not self.resources.engine_dead:
-            await self.call_utility_async("resume_requests", request_ids)
-
-    async def pause_scheduler_async(
-        self, mode: PauseMode = "abort", clear_cache: bool = True
-    ) -> None:
-        await self.call_utility_async("pause_scheduler", mode, clear_cache)
-
-    async def resume_scheduler_async(self) -> None:
-        await self.call_utility_async("resume_scheduler")
-
-    async def is_scheduler_paused_async(self) -> bool:
-        return await self.call_utility_async("is_scheduler_paused")
-
-    async def profile_async(
-        self, is_start: bool = True, profile_prefix: str | None = None
-    ) -> None:
-        await self.call_utility_async("profile", is_start, profile_prefix)
-
-    async def reset_mm_cache_async(self) -> None:
-        await self.call_utility_async("reset_mm_cache")
-
-    async def reset_prefix_cache_async(
-        self, reset_running_requests: bool = False, reset_connector: bool = False
-    ) -> bool:
-        return await self.call_utility_async(
-            "reset_prefix_cache", reset_running_requests, reset_connector
-        )
-
-    async def reset_encoder_cache_async(self) -> None:
-        await self.call_utility_async("reset_encoder_cache")
-
-    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
-        await self.call_utility_async("sleep", level, mode)
-
-    async def wake_up_async(self, tags: list[str] | None = None) -> None:
-        await self.call_utility_async("wake_up", tags)
-
-    async def is_sleeping_async(self) -> bool:
-        return await self.call_utility_async("is_sleeping")
-
-    async def execute_dummy_batch_async(self) -> None:
-        await self.call_utility_async("execute_dummy_batch")
-
-    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
-        return await self.call_utility_async("add_lora", lora_request)
-
-    async def remove_lora_async(self, lora_id: int) -> bool:
-        return await self.call_utility_async("remove_lora", lora_id)
-
-    async def list_loras_async(self) -> set[int]:
-        return await self.call_utility_async("list_loras")
-
-    async def pin_lora_async(self, lora_id: int) -> bool:
-        return await self.call_utility_async("pin_lora", lora_id)
-
-    async def save_sharded_state_async(
-        self, path: str, pattern: str | None = None, max_size: int | None = None
-    ) -> None:
-        await self.call_utility_async("save_sharded_state", path, pattern, max_size)
-
-    async def collective_rpc_async(
-        self,
-        method: str | Callable[..., _R],
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> list[_R]:
-        return await self.call_utility_async(
-            "collective_rpc", method, timeout, args, kwargs
-        )
 
 
 class DPAsyncMPClient(AsyncMPClient):

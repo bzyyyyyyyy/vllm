@@ -721,21 +721,42 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
-        if self.scheduler:
-            self.scheduler.shutdown()
+        errors: list[Exception] = []
+
+        def cleanup_resource(name: str, cleanup: Callable[[], Any]) -> None:
+            try:
+                cleanup()
+            except Exception as error:
+                logger.exception("EngineCore failed to clean up %s", name)
+                errors.append(error)
+
+        # Use getattr throughout so an in-process EngineCore whose constructor
+        # failed partway through still releases every resource it did create.
+        structured_output_manager = getattr(
+            self, "structured_output_manager", None
+        )
+        if structured_output_manager is not None:
+            cleanup_resource(
+                "structured output manager", structured_output_manager.clear_backend
+            )
+        model_executor = getattr(self, "model_executor", None)
+        if model_executor is not None:
+            cleanup_resource("model executor", model_executor.shutdown)
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None:
+            cleanup_resource("scheduler", scheduler.shutdown)
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
         # visible to the garbage collector again. Without this, deleting
         # the engine in-process (e.g. unit tests) leaks GPU memory.
-        gc.unfreeze()
+        cleanup_resource("frozen GC heap", gc.unfreeze)
         # Tear down distributed state initialized in this EngineCore process
         # before it exits and release cached memory.
-        cleanup_dist_env_and_memory()
+        cleanup_resource("distributed environment", cleanup_dist_env_and_memory)
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
+        if errors:
+            raise errors[0]
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)

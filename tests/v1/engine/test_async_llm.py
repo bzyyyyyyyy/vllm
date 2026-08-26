@@ -674,6 +674,112 @@ async def collect_outputs(
     return final_output
 
 
+@pytest.mark.asyncio
+async def test_async_inproc_request_and_prefix_controls():
+    """Owner-thread backend preserves the custom request/prefix control APIs."""
+    engine_args = AsyncEngineArgs(
+        model=TEXT_ENGINE_ARGS.model,
+        enforce_eager=True,
+        enable_prefix_caching=True,
+    )
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(
+                engine_args, enable_multiprocessing=False
+            )
+        after.callback(engine.shutdown)
+
+        pin_id = "async-inproc-prefix"
+        prefix = " ".join([TEXT_PROMPT] * 16)
+        pin_result = await asyncio.wait_for(
+            engine.pin_prefix(prefix, pin_id, level="gpu"), timeout=30.0
+        )
+        assert pin_result["pin_id"] == pin_id
+        assert pin_result["level"] == "gpu"
+        assert pin_result["pinned_tokens"] > 0
+
+        # These are documented no-ops once a pin has completed, but still
+        # exercise the deferred utility bridge used by pending pin controls.
+        await engine.pause_prefix(pin_id)
+        await engine.resume_prefix(pin_id)
+        assert await engine.unpin_prefix(pin_id)
+        assert not await engine.unpin_prefix(pin_id)
+
+        request_id = "async-inproc-request-control"
+        outputs: list[RequestOutput] = []
+
+        async def generate_request() -> RequestOutput:
+            async for output in engine.generate(
+                request_id=request_id,
+                prompt=TEXT_PROMPT,
+                sampling_params=SamplingParams(max_tokens=1000, ignore_eos=True),
+            ):
+                outputs.append(output)
+            return outputs[-1]
+
+        async def wait_for_output_count(count: int) -> None:
+            while len(outputs) < count:
+                await asyncio.sleep(0.01)
+
+        generation_task = asyncio.create_task(generate_request())
+        await asyncio.wait_for(wait_for_output_count(3), timeout=30.0)
+
+        await engine.pause(request_id)
+        # Allow already-published outputs to drain before checking the freeze.
+        await asyncio.sleep(0.1)
+        paused_output_count = len(outputs)
+        await asyncio.sleep(0.3)
+        assert len(outputs) == paused_output_count
+
+        await engine.resume(request_id)
+        await asyncio.wait_for(
+            wait_for_output_count(paused_output_count + 1), timeout=30.0
+        )
+        await engine.abort(request_id)
+        final_output = await asyncio.wait_for(generation_task, timeout=30.0)
+        assert final_output.finished
+        assert final_output.outputs[0].finish_reason == "abort"
+
+
+@pytest.mark.asyncio
+async def test_async_inproc_cpu_prefix_controls():
+    """CPU prefix controls complete without stalling the owner thread."""
+    engine_args = AsyncEngineArgs(
+        model=TEXT_ENGINE_ARGS.model,
+        enforce_eager=True,
+        enable_prefix_caching=True,
+        kv_offloading_size=1.0,
+    )
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(
+                engine_args, enable_multiprocessing=False
+            )
+        after.callback(engine.shutdown)
+
+        pin_id = "async-inproc-cpu-prefix"
+        prefix = " ".join([TEXT_PROMPT] * 16)
+        pin_task = asyncio.create_task(engine.pin_prefix(prefix, pin_id, level="cpu"))
+        pin_result = await asyncio.wait_for(pin_task, timeout=60.0)
+        assert pin_task.done()
+        assert pin_result["pin_id"] == pin_id
+        assert pin_result["level"] == "cpu"
+        assert pin_result["pinned_tokens"] > 0
+
+        # Completed-prefix pause/resume calls are idempotent no-ops, but each
+        # call still traverses the AsyncInproc utility/Future bridge.
+        for _ in range(2):
+            await asyncio.wait_for(engine.pause_prefix(pin_id), timeout=10.0)
+        for _ in range(2):
+            await asyncio.wait_for(engine.resume_prefix(pin_id), timeout=10.0)
+
+        assert await asyncio.wait_for(engine.unpin_prefix(pin_id), timeout=10.0)
+        assert not await asyncio.wait_for(
+            engine.unpin_prefix(pin_id), timeout=10.0
+        )
+        assert not engine.errored
+
+
 # =============================================================================
 # Pause/Resume Tests
 # =============================================================================

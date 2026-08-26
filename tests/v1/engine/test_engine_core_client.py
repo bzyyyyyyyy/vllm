@@ -6,6 +6,7 @@ import importlib
 import inspect
 import os
 import signal
+import threading
 import time
 import uuid
 from concurrent.futures import Future
@@ -27,15 +28,21 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreReadyResponse, EngineCoreRequest
+from vllm.v1.engine import (
+    EngineCoreOutputs,
+    EngineCoreReadyResponse,
+    EngineCoreRequest,
+)
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import (
+    AsyncInprocClient,
     AsyncMPClient,
     DPLBAsyncMPClient,
     EngineCoreClient,
     MPClient,
     SyncMPClient,
 )
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.pool.late_interaction import (
@@ -325,6 +332,14 @@ def echo(self, msg: str, err_msg: str | None = None, sleep: float | None = None)
     return msg
 
 
+def execution_identity(self) -> tuple[int, int]:
+    """Return the process and thread currently executing an EngineCore utility."""
+    import os
+    import threading
+
+    return os.getpid(), threading.get_ident()
+
+
 @dataclass
 class TestMessage:
     """Test dataclass for verifying custom type serialization."""
@@ -413,7 +428,9 @@ def subprocess_echo_patch(monkeypatch, tmp_path):
                 "import time",
                 "from vllm.v1.engine.core import EngineCore",
                 inspect.getsource(echo),
+                inspect.getsource(execution_identity),
                 "EngineCore.echo = echo",
+                "EngineCore.execution_identity = execution_identity",
             ]
         )
     )
@@ -610,13 +627,18 @@ def test_engine_core_client(
 
 
 @pytest.mark.asyncio(loop_scope="function")
+@pytest.mark.parametrize("multiprocessing_mode", [True, False])
 async def test_engine_core_client_asyncio(
     monkeypatch: pytest.MonkeyPatch,
+    multiprocessing_mode: bool,
     subprocess_echo_patch,
 ):
     with monkeypatch.context() as m:
         # Monkey-patch core engine utility function to test.
         m.setattr(EngineCore, "echo", echo, raising=False)
+        m.setattr(
+            EngineCore, "execution_identity", execution_identity, raising=False
+        )
 
         engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
         vllm_config = engine_args.create_engine_config(
@@ -626,7 +648,7 @@ async def test_engine_core_client_asyncio(
 
         with set_default_torch_num_threads(1):
             client = EngineCoreClient.make_client(
-                multiprocess_mode=True,
+                multiprocess_mode=multiprocessing_mode,
                 asyncio_mode=True,
                 vllm_config=vllm_config,
                 executor_class=executor_class,
@@ -634,6 +656,9 @@ async def test_engine_core_client_asyncio(
             )
 
         try:
+            expected_type = AsyncMPClient if multiprocessing_mode else AsyncInprocClient
+            assert isinstance(client, expected_type)
+
             MAX_TOKENS = 20
             params = SamplingParams(max_tokens=MAX_TOKENS)
             """Normal Request Cycle."""
@@ -676,10 +701,21 @@ async def test_engine_core_client_asyncio(
                     )
             """Utility method invocation"""
 
-            core_client: AsyncMPClient = client
+            core_client: AsyncMPClient | AsyncInprocClient = client
 
             result = await core_client.call_utility_async("echo", "testarg")
             assert result == "testarg"
+
+            owner_pid, owner_thread_id = await core_client.call_utility_async(
+                "execution_identity"
+            )
+            if multiprocessing_mode:
+                assert owner_pid != os.getpid()
+            else:
+                assert owner_pid == os.getpid()
+                assert client.resources.thread is not None
+                assert owner_thread_id == client.resources.thread.ident
+                assert owner_thread_id != threading.get_ident()
 
             with pytest.raises(Exception) as e_info:
                 await core_client.call_utility_async("echo", None, "help!")
@@ -703,7 +739,215 @@ async def test_engine_core_client_asyncio(
             )
             assert result == "testarg3"
         finally:
+            owner_thread = (
+                client.resources.thread if not multiprocessing_mode else None
+            )
             client.shutdown()
+            if owner_thread is not None:
+                assert not owner_thread.is_alive()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_async_inproc_client_propagates_fatal_step_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A fatal owner-thread EngineCore failure reaches async output consumers."""
+
+    def fail_step(
+        _self: EngineCore,
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        raise RuntimeError("in-process fatal step")
+
+    with monkeypatch.context() as m:
+        # EngineCore.__init__ binds ``step_fn`` from ``step`` after model load.
+        m.setattr(EngineCore, "step", fail_step)
+
+        engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
+        vllm_config = engine_args.create_engine_config(UsageContext.UNKNOWN_CONTEXT)
+        executor_class = Executor.get_class(vllm_config)
+
+        with set_default_torch_num_threads(1):
+            client = EngineCoreClient.make_client(
+                multiprocess_mode=False,
+                asyncio_mode=True,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=False,
+            )
+
+        assert isinstance(client, AsyncInprocClient)
+        owner_thread = client.resources.thread
+        assert owner_thread is not None and owner_thread.is_alive()
+        try:
+            await client.add_request_async(make_request(SamplingParams(max_tokens=1)))
+            with pytest.raises(EngineDeadError):
+                await asyncio.wait_for(client.get_output_async(), timeout=30.0)
+            assert client.resources.engine_dead
+            assert isinstance(client.resources.fatal_error, RuntimeError)
+            assert client.resources.fatal_error.__traceback__ is None
+        finally:
+            client.shutdown()
+
+        assert not owner_thread.is_alive()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_async_inproc_shutdown_wakes_output_waiter():
+    """Normal shutdown terminates a consumer already waiting for output."""
+    engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
+    vllm_config = engine_args.create_engine_config(UsageContext.UNKNOWN_CONTEXT)
+    executor_class = Executor.get_class(vllm_config)
+
+    with set_default_torch_num_threads(1):
+        client = EngineCoreClient.make_client(
+            multiprocess_mode=False,
+            asyncio_mode=True,
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=False,
+        )
+
+    assert isinstance(client, AsyncInprocClient)
+    output_waiter = asyncio.create_task(client.get_output_async())
+    await asyncio.sleep(0)
+    client.shutdown()
+    with pytest.raises(EngineDeadError):
+        await asyncio.wait_for(output_waiter, timeout=5.0)
+
+
+def test_async_inproc_shutdown_propagates_teardown_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Explicit shutdown reports cleanup failure after releasing resources."""
+    original_shutdown = EngineCore.shutdown
+
+    def shutdown_then_fail(engine_core: EngineCore) -> None:
+        original_shutdown(engine_core)
+        raise RuntimeError("in-process teardown failure")
+
+    with monkeypatch.context() as m:
+        m.setattr(EngineCore, "shutdown", shutdown_then_fail)
+
+        engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
+        vllm_config = engine_args.create_engine_config(UsageContext.UNKNOWN_CONTEXT)
+        executor_class = Executor.get_class(vllm_config)
+
+        with set_default_torch_num_threads(1):
+            client = EngineCoreClient.make_client(
+                multiprocess_mode=False,
+                asyncio_mode=True,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=False,
+            )
+
+        assert isinstance(client, AsyncInprocClient)
+        owner_thread = client.resources.thread
+        assert owner_thread is not None
+        with pytest.raises(RuntimeError, match="in-process teardown failure"):
+            client.shutdown()
+        assert not owner_thread.is_alive()
+
+
+def test_async_inproc_client_cleans_up_failed_startup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failure after model/KV initialization cannot leak the owner thread."""
+    initialize_kv_caches = EngineCore._initialize_kv_caches
+
+    def initialize_then_fail(engine_core: EngineCore, *args, **kwargs):
+        initialize_kv_caches(engine_core, *args, **kwargs)
+        raise RuntimeError("in-process startup failure")
+
+    owner_threads_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name == "AsyncInprocEngineCore"
+    }
+
+    with monkeypatch.context() as m:
+        m.setattr(EngineCore, "_initialize_kv_caches", initialize_then_fail)
+
+        engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
+        vllm_config = engine_args.create_engine_config(UsageContext.UNKNOWN_CONTEXT)
+        executor_class = Executor.get_class(vllm_config)
+
+        with (
+            set_default_torch_num_threads(1),
+            pytest.raises(RuntimeError, match="in-process startup failure"),
+        ):
+            EngineCoreClient.make_client(
+                multiprocess_mode=False,
+                asyncio_mode=True,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=False,
+            )
+
+    owner_threads_after = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name == "AsyncInprocEngineCore"
+    }
+    assert owner_threads_after == owner_threads_before
+
+
+@pytest.mark.parametrize(
+    "parallel_arg",
+    ["tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size"],
+)
+def test_async_inproc_client_rejects_parallelism(parallel_arg: str):
+    engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
+    vllm_config = engine_args.create_engine_config(UsageContext.UNKNOWN_CONTEXT)
+    executor_class = Executor.get_class(vllm_config)
+    setattr(vllm_config.parallel_config, parallel_arg, 2)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"AsyncInprocClient.*{parallel_arg}=2",
+    ):
+        EngineCoreClient.make_client(
+            multiprocess_mode=False,
+            asyncio_mode=True,
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("client_kwargs", "error_field"),
+    [
+        pytest.param({"client_count": 2}, "client_count", id="client-count"),
+        pytest.param({"client_index": 1}, "client_index", id="client-index"),
+        pytest.param(
+            {
+                "client_addresses": {
+                    "input_address": "inproc://input",
+                    "output_address": "inproc://output",
+                }
+            },
+            "client_addresses",
+            id="external-addresses",
+        ),
+    ],
+)
+def test_async_inproc_client_rejects_external_clients(
+    client_kwargs: dict[str, Any], error_field: str
+):
+    engine_args = EngineArgs(model=MODEL_NAME, enforce_eager=True)
+    vllm_config = engine_args.create_engine_config(UsageContext.UNKNOWN_CONTEXT)
+    executor_class = Executor.get_class(vllm_config)
+
+    with pytest.raises(ValueError, match=rf"AsyncInprocClient.*{error_field}"):
+        EngineCoreClient.make_client(
+            multiprocess_mode=False,
+            asyncio_mode=True,
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=False,
+            **client_kwargs,
+        )
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -922,8 +1166,10 @@ async def test_engine_core_client_util_method_nested_structures(
 
 
 @pytest.mark.asyncio(loop_scope="function")
+@pytest.mark.parametrize("multiprocessing_mode", [True, False])
 async def test_engine_core_client_future_utility_async(
     monkeypatch: pytest.MonkeyPatch,
+    multiprocessing_mode: bool,
     subprocess_future_echo_patch,
 ):
     """Test that a utility returning a Future completes when the future is done
@@ -940,7 +1186,7 @@ async def test_engine_core_client_future_utility_async(
 
         with set_default_torch_num_threads(1):
             client = EngineCoreClient.make_client(
-                multiprocess_mode=True,
+                multiprocess_mode=multiprocessing_mode,
                 asyncio_mode=True,
                 vllm_config=vllm_config,
                 executor_class=executor_class,
@@ -948,7 +1194,9 @@ async def test_engine_core_client_future_utility_async(
             )
 
         try:
-            core_client: AsyncMPClient = client
+            expected_type = AsyncMPClient if multiprocessing_mode else AsyncInprocClient
+            assert isinstance(client, expected_type)
+            core_client: AsyncMPClient | AsyncInprocClient = client
 
             # Completes after 2 engine steps (num_wait_loops=2)
             result = await core_client.call_utility_async(

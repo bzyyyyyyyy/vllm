@@ -15,6 +15,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.platforms import current_platform
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.core_client import AsyncInprocClient, AsyncMPClient
 
 MODELS = ["hmellor/tiny-random-LlamaForCausalLM"]
 
@@ -22,17 +23,23 @@ MODELS = ["hmellor/tiny-random-LlamaForCausalLM"]
 @pytest.mark.asyncio
 @pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
 @pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("tensor_parallel_size", [2, 1])
+@pytest.mark.parametrize(
+    "tensor_parallel_size,enable_multiprocessing",
+    [(2, True), (1, True), (1, False)],
+)
 @pytest.mark.parametrize("send_one_request", [False, True])
 async def test_async_llm_delete(
-    model: str, tensor_parallel_size: int, send_one_request: bool
+    model: str,
+    tensor_parallel_size: int,
+    enable_multiprocessing: bool,
+    send_one_request: bool,
 ) -> None:
     """Test that AsyncLLM frees GPU memory upon deletion.
-    AsyncLLM always uses an MP client.
 
     Args:
       model: model under test
       tensor_parallel_size: degree of tensor parallelism
+      enable_multiprocessing: run EngineCore in a child process when true
       send_one_request: send one request to engine before deleting
     """
     if current_platform.device_count() < tensor_parallel_size:
@@ -44,7 +51,11 @@ async def test_async_llm_delete(
 
     # Instantiate AsyncLLM; make request to complete any deferred
     # initialization; then delete instance
-    async_llm = AsyncLLM.from_engine_args(engine_args)
+    async_llm = AsyncLLM.from_engine_args(
+        engine_args, enable_multiprocessing=enable_multiprocessing
+    )
+    expected_type = AsyncMPClient if enable_multiprocessing else AsyncInprocClient
+    assert isinstance(async_llm.engine_core, expected_type)
     if send_one_request:
         async for _ in async_llm.generate(
             "Hello my name is",
@@ -59,6 +70,55 @@ async def test_async_llm_delete(
     # Confirm all the processes are cleaned up.
     wait_for_gpu_memory_to_clear(
         devices=list(range(tensor_parallel_size)),
+        threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
+@pytest.mark.parametrize("model", MODELS)
+async def test_async_llm_inprocess_shutdown_is_idempotent(model: str) -> None:
+    """Explicit shutdown and finalization are both safe for the thread client."""
+    engine_args = AsyncEngineArgs(model=model, enforce_eager=True)
+    async_llm = AsyncLLM.from_engine_args(
+        engine_args, enable_multiprocessing=False
+    )
+
+    assert isinstance(async_llm.engine_core, AsyncInprocClient)
+    async_llm.shutdown()
+    async_llm.shutdown()
+    del async_llm
+
+    wait_for_gpu_memory_to_clear(
+        devices=[0],
+        threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
+@pytest.mark.parametrize("model", MODELS)
+async def test_async_llm_inprocess_compiled_model_cleanup(model: str) -> None:
+    """Compiled-model bytecode hooks cannot retain the in-process engine."""
+    engine_args = AsyncEngineArgs(model=model, enforce_eager=False)
+    async_llm = AsyncLLM.from_engine_args(
+        engine_args, enable_multiprocessing=False
+    )
+
+    try:
+        async for _ in async_llm.generate(
+            "Hello my name is",
+            request_id="compiled-cleanup",
+            sampling_params=SamplingParams(
+                max_tokens=1, output_kind=RequestOutputKind.DELTA
+            ),
+        ):
+            pass
+    finally:
+        async_llm.shutdown()
+    del async_llm
+    wait_for_gpu_memory_to_clear(
+        devices=[0],
         threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
     )
 

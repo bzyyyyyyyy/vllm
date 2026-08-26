@@ -85,6 +85,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        enable_multiprocessing: bool = True,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -97,6 +98,9 @@ class AsyncLLM(EngineClient):
             mm_registry: Multi-modal registry.
             log_requests: Whether to log requests.
             start_engine_loop: Whether to start the engine loop.
+            enable_multiprocessing: Whether to run the EngineCore in a
+                separate process. When disabled, the asynchronous in-process
+                client owns the EngineCore in a dedicated thread.
             stat_loggers: customized stat loggers for the engine.
                 If not provided, default stat loggers will be used.
                 PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
@@ -143,8 +147,10 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
         )
 
-        # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
+        # EngineCore (using the selected async client backend).
+        self.engine_core = EngineCoreClient.make_client(
+            multiprocess_mode=enable_multiprocessing,
+            asyncio_mode=True,
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
@@ -213,6 +219,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        enable_multiprocessing: bool = True,
     ) -> "AsyncLLM":
         # Create the LLMEngine.
         return cls(
@@ -227,6 +234,7 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_count=client_count,
             client_index=client_index,
+            enable_multiprocessing=enable_multiprocessing,
         )
 
     @classmethod
@@ -236,6 +244,7 @@ class AsyncLLM(EngineClient):
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
+        enable_multiprocessing: bool = True,
     ) -> "AsyncLLM":
         """Create an AsyncLLM from the EngineArgs."""
 
@@ -252,13 +261,14 @@ class AsyncLLM(EngineClient):
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            enable_multiprocessing=enable_multiprocessing,
         )
 
     def __del__(self):
         self.shutdown()
 
     def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown, cleaning up the background proc and IPC."""
+        """Shutdown, cleaning up the EngineCore client and its resources."""
         shutdown_prometheus()
 
         if renderer := getattr(self, "renderer", None):
