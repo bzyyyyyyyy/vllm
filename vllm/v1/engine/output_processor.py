@@ -452,6 +452,35 @@ class OutputProcessor:
     def has_unfinished_requests(self) -> bool:
         return len(self.request_states) > 0
 
+    def get_internal_request_ids(
+        self,
+        request_ids: Iterable[str],
+        *,
+        internal: bool = False,
+    ) -> list[str]:
+        """Resolve active request IDs without closing their output streams."""
+        resolved: list[str] = []
+        seen: set[str] = set()
+
+        def add_request(request_id: str) -> None:
+            if request_id in self.request_states:
+                if request_id not in seen:
+                    seen.add(request_id)
+                    resolved.append(request_id)
+                return
+            parent = self.parent_requests.get(request_id)
+            if parent is not None:
+                for child_request_id in parent.child_requests:
+                    add_request(child_request_id)
+
+        for request_id in request_ids:
+            if internal:
+                add_request(request_id)
+            else:
+                for internal_request_id in self.external_req_ids.get(request_id, ()):
+                    add_request(internal_request_id)
+        return resolved
+
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
 

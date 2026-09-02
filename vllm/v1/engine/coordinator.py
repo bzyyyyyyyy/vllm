@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import copy
 import multiprocessing
 import multiprocessing.connection
+import threading
 import time
 import weakref
 
@@ -79,6 +81,8 @@ class DPCoordinator:
     def __init__(
         self, parallel_config: ParallelConfig, enable_wave_coordination: bool = True
     ):
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_complete = False
         dp_size = parallel_config.data_parallel_size
         assert dp_size > 1, "Coordinator only used for data parallel"
 
@@ -111,18 +115,51 @@ class DPCoordinator:
             },
             daemon=True,
         )
-        self.proc.start()
+        self._started_processes: list[multiprocessing.Process] = []
+        self._finalizer = weakref.finalize(
+            self, shutdown, self._started_processes
+        )
+        try:
+            try:
+                self.proc.start()
+            finally:
+                if self.proc.pid is not None:
+                    self._started_processes.append(self.proc)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                child_zmq_addr_pipe.close()
+            with contextlib.suppress(Exception):
+                parent_zmq_addr_pipe.close()
+            try:
+                self.shutdown()
+            except BaseException:
+                logger.exception(
+                    "DP coordinator cleanup failed during process startup; "
+                    "the finalizer remains armed for retry"
+                )
+            raise
+        # Cleanup is already armed, so a startup handshake failure cannot
+        # orphan the coordinator.
         child_zmq_addr_pipe.close()
-        (
-            front_publish_address,
-            back_output_address,
-            back_publish_address,
-        ) = self._wait_for_zmq_addrs(parent_zmq_addr_pipe)
+        try:
+            (
+                front_publish_address,
+                back_output_address,
+                back_publish_address,
+            ) = self._wait_for_zmq_addrs(parent_zmq_addr_pipe)
+        except BaseException:
+            try:
+                self.shutdown()
+            except BaseException:
+                logger.exception(
+                    "DP coordinator cleanup failed during startup; the "
+                    "finalizer remains armed for retry"
+                )
+            raise
 
         self.stats_publish_address = front_publish_address
         self.coord_in_address = back_publish_address
         self.coord_out_address = back_output_address
-        self._finalizer = weakref.finalize(self, shutdown, [self.proc])
 
     def get_stats_publish_address(self) -> str:
         return self.stats_publish_address
@@ -133,8 +170,15 @@ class DPCoordinator:
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown coordinator process with configurable timeout."""
-        if self._finalizer.detach() is not None:
-            shutdown([self.proc], timeout=timeout)
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            if not self._finalizer.alive:
+                self._shutdown_complete = True
+                return
+            shutdown(self._started_processes, timeout=timeout)
+            self._finalizer.detach()
+            self._shutdown_complete = True
 
 
 class EngineState:

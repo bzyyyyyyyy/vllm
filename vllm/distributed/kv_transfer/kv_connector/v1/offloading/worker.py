@@ -58,6 +58,9 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        self._load_job_block_ids: dict[int, set[int]] = {}
+        self._failed_load_req_ids: set[ReqId] = set()
+        self._invalid_load_block_ids: set[int] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -307,27 +310,39 @@ class OffloadingConnectorWorker:
                     )
 
         # Submit deferred stores from previous step (and jobs_to_flush above).
+        failed_submit_ids: set[int] = set()
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            if not success:
+                failed_submit_ids.add(job_id)
+                self._connector_worker_meta.mark_failed(job_id)
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
-            self.worker.wait(kv_connector_metadata.jobs_to_flush)
+            jobs_to_wait = kv_connector_metadata.jobs_to_flush - failed_submit_ids
+            if jobs_to_wait:
+                self.worker.wait(jobs_to_wait)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            if not success:
+                self._connector_worker_meta.mark_failed(job_id)
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            self._load_job_block_ids[job_id] = {
+                int(block_id)
+                for block_id in entry.dst_spec.block_ids
+                if block_id != 0
+            }
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
-            assert success
+            if not success:
+                self._failed_load_req_ids.add(self._record_load_failure(job_id))
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -343,6 +358,12 @@ class OffloadingConnectorWorker:
                 (job_id, entry.src_spec, entry.dst_spec)
             )
 
+    def _record_load_failure(self, job_id: int) -> ReqId:
+        req_id = self._load_jobs.pop(job_id)
+        self._invalid_load_block_ids.update(self._load_job_block_ids.pop(job_id))
+        self._connector_worker_meta.mark_failed(job_id)
+        return req_id
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """
         Returns:
@@ -354,12 +375,17 @@ class OffloadingConnectorWorker:
             blocked on remote KV (and free aborted-during-load reqs).
         """
         assert self.worker is not None
-        finished_recving: set[str] = set()
+        finished_recving: set[str] = set(self._failed_load_req_ids)
+        self._failed_load_req_ids.clear()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
+            if not transfer_result.success:
+                if is_load:
+                    finished_recving.add(self._record_load_failure(job_id))
+                else:
+                    self._connector_worker_meta.mark_failed(job_id)
+                continue
             if (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
@@ -376,21 +402,33 @@ class OffloadingConnectorWorker:
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
+                self._load_job_block_ids.pop(job_id)
                 finished_recving.add(req_id)
 
         return set(), finished_recving
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
-        """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        """Return completed or failed transfer jobs since the last call."""
+        if (
+            not self._connector_worker_meta.completed_jobs
+            and not self._connector_worker_meta.failed_jobs
+        ):
             return None
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()
         return meta
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        invalid_block_ids = self._invalid_load_block_ids
+        self._invalid_load_block_ids = set()
+        return invalid_block_ids
+
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._load_job_block_ids.clear()
+        self._failed_load_req_ids.clear()
+        self._invalid_load_block_ids.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()

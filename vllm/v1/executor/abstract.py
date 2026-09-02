@@ -95,8 +95,11 @@ class Executor(ABC):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        *,
+        inproc_engine: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.inproc_engine = inproc_engine
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -106,7 +109,22 @@ class Executor(ABC):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
-        self._init_executor()
+        try:
+            self._init_executor()
+        except BaseException:
+            # In owner-thread mode, a failed constructor cannot rely on process
+            # exit for cleanup, and EngineCore's assignment of this executor
+            # has not completed yet. Tear down any partial driver/worker here
+            # while preserving the original startup exception.
+            if self.inproc_engine:
+                try:
+                    self.shutdown()
+                except BaseException:
+                    logger.exception(
+                        "Failed to clean up partially initialized in-process "
+                        "executor"
+                    )
+            raise
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
         self.kv_output_aggregator: KVOutputAggregator | None = None

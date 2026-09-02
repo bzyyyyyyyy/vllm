@@ -48,6 +48,10 @@ class EngineCoreSentinel:
         self.fault_info: str | None = None
         self._dp_reinit_epoch = 0
 
+    def reset_dp_reinit_epoch(self) -> None:
+        """Start FT store keys from a common epoch after a DP group switch."""
+        self._dp_reinit_epoch = 0
+
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
         """Dispatch an FT command by instruction name."""
         ft_request = FaultToleranceRequest(**ft_args)

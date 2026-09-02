@@ -45,6 +45,10 @@ envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 rust_build = load_module_from_path(
     "rust_build", os.path.join(ROOT_DIR, "tools", "build_rust.py")
 )
+precompiled_wheel_selection = load_module_from_path(
+    "precompiled_wheel_selection",
+    os.path.join(ROOT_DIR, "tools", "precompiled_wheel_selection.py"),
+)
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
@@ -678,13 +682,11 @@ class precompiled_wheel_utils:
             variant = os.getenv("VLLM_PRECOMPILED_WHEEL_VARIANT", None)
             if variant is None:
                 variant = precompiled_wheel_utils.detect_system_cuda_variant()
-            commit = os.getenv("VLLM_PRECOMPILED_WHEEL_COMMIT", "").lower()
-            if not commit or len(commit) != 40:
-                print(
-                    f"VLLM_PRECOMPILED_WHEEL_COMMIT not valid: {commit}"
-                    ", trying to fetch base commit in main branch"
-                )
-                commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
+            commit = precompiled_wheel_selection.resolve_precompiled_wheel_commit(
+                os.getenv("VLLM_PRECOMPILED_WHEEL_COMMIT"),
+                docker_build_context=envs.VLLM_DOCKER_BUILD_CONTEXT,
+                repo_dir=ROOT_DIR,
+            )
             print(f"Using precompiled wheel commit {commit} with variant {variant}")
             try_default = False
             wheels, repo_url, download_filename = None, None, None
@@ -872,67 +874,10 @@ class precompiled_wheel_utils:
 
     @staticmethod
     def get_base_commit_in_main_branch() -> str:
-        try:
-            # Get the latest commit hash of the upstream main branch.
-            curl_cmd = [
-                "curl",
-                "-s",
-                "https://api.github.com/repos/vllm-project/vllm/commits/main",
-            ]
-            github_token = os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN"))
-            if github_token:
-                curl_cmd += [
-                    "-H",
-                    f"Authorization: token {github_token}",
-                ]
-            resp_json = subprocess.check_output(curl_cmd).decode("utf-8")
-            upstream_main_commit = json.loads(resp_json)["sha"]
-            print(f"Upstream main branch latest commit: {upstream_main_commit}")
-
-            # In Docker build context, .git may be immutable or missing.
-            if envs.VLLM_DOCKER_BUILD_CONTEXT:
-                return upstream_main_commit
-
-            # Check if the upstream_main_commit exists in the local repo
-            try:
-                subprocess.check_output(
-                    ["git", "cat-file", "-e", f"{upstream_main_commit}"]
-                )
-            except subprocess.CalledProcessError:
-                # If not present, fetch it from the remote repository.
-                # Note that this does not update any local branches,
-                # but ensures that this commit ref and its history are
-                # available in our local repo.
-                subprocess.check_call(
-                    ["git", "fetch", "https://github.com/vllm-project/vllm", "main"]
-                )
-
-            # Then get the commit hash of the current branch that is the same as
-            # the upstream main commit.
-            current_branch = (
-                subprocess.check_output(["git", "branch", "--show-current"])
-                .decode("utf-8")
-                .strip()
-            )
-
-            base_commit = (
-                subprocess.check_output(
-                    ["git", "merge-base", f"{upstream_main_commit}", current_branch]
-                )
-                .decode("utf-8")
-                .strip()
-            )
-            return base_commit
-        except ValueError as err:
-            raise ValueError(err) from None
-        except Exception as err:
-            logger.warning(
-                "Failed to get the base commit in the main branch. "
-                "Using the nightly wheel. The libraries in this "
-                "wheel may not be compatible with your dev branch: %s",
-                err,
-            )
-            return "nightly"
+        return precompiled_wheel_selection.get_base_commit_in_main_branch(
+            docker_build_context=envs.VLLM_DOCKER_BUILD_CONTEXT,
+            repo_dir=ROOT_DIR,
+        )
 
 
 def _no_device() -> bool:

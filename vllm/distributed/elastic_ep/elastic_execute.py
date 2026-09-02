@@ -39,6 +39,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    get_ep_all2all_manager,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
     make_eep_staged_quant_method,
@@ -487,6 +490,8 @@ class ElasticEPScalingExecutor:
                     module._replace_quant_method(module._quant_method.old_quant_method)
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
 
+        self._refresh_ep_fault_detection(new_dp_size)
+
         eplb_model_state.expert_buffer = [
             torch.empty_like(w) for w in model.expert_weights[0]
         ]
@@ -514,6 +519,15 @@ class ElasticEPScalingExecutor:
             )
             compilation_counter.stock_torch_compile_count += 1
             self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
+
+    def _refresh_ep_fault_detection(self, new_dp_size: int) -> None:
+        """Refresh the async EP-fault probe after replacing active groups."""
+        model_runner = self.worker.model_runner
+        model_runner.check_ep_fault = (
+            new_dp_size > 1
+            and model_runner.model_config.is_moe
+            and get_ep_all2all_manager().support_fault_tolerance
+        )
 
     def _perform_eplb_reshuffle(
         self, rank_mapping: dict[int, int] | None = None

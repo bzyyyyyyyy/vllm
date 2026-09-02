@@ -459,6 +459,10 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        # Overridden by the owning Worker after construction. CUDA-graph GC
+        # controls are process-global and must stay disabled when this runner
+        # shares the embedding application's process.
+        self.inproc_engine = False
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -4579,6 +4583,36 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        if scheduler_output.skip_sampler:
+            self._draft_token_ids = None
+            self._draft_probs = None
+            self._draft_prob_req_ids = None
+            self._draft_token_req_ids = None
+            self.valid_sampled_token_count_gpu = None
+            self.input_batch.prev_sampled_token_ids = None
+
+            if self.speculative_config is not None:
+                self.finalize_kv_connector()
+
+            with record_function_or_nullcontext("gpu_model_runner: eplb"):
+                self.eplb_step()
+
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
+            req_ids = self.input_batch.req_ids.copy()
+            return ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[[] for _ in req_ids],
+                prompt_logprobs_dict={},
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
+                cudagraph_stats=cudagraph_stats,
+                routed_experts=None,
+            )
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -6533,9 +6567,12 @@ class GPUModelRunner(
 
         logger.debug("Initialized minimal KV cache for CUDA graph profiling")
 
-    @staticmethod
     @contextmanager
-    def _freeze_gc():
+    def _freeze_gc(self):
+        if self.inproc_engine:
+            yield
+            return
+
         gc.collect()
         should_freeze = not envs.VLLM_ENABLE_CUDAGRAPH_GC
         if should_freeze:

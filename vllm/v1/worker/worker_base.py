@@ -83,6 +83,10 @@ class WorkerBase:
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
+        # True only when this worker shares the embedding application's
+        # process through AsyncInprocClient. Process-global lifecycle knobs
+        # must remain owned by the application in that mode.
+        self.inproc_engine = False
 
         # Device and model state
         self.device: torch.device | None = None
@@ -216,8 +220,10 @@ class WorkerWrapperBase:
         self.vllm_config: VllmConfig
 
     def shutdown(self) -> None:
-        if self.worker is not None:
-            self.worker.shutdown()
+        # __getattr__ delegates to ``worker`` and cannot be used before that
+        # attribute is assigned during a failed init_worker call.
+        if worker := self.__dict__.get("worker"):
+            worker.shutdown()
 
     def update_environment_variables(
         self,
@@ -293,6 +299,7 @@ class WorkerWrapperBase:
             )
 
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
+        inproc_engine = kwargs.pop("inproc_engine", False)
         if shared_worker_lock is None:
             msg = (
                 "Missing `shared_worker_lock` argument from executor. "
@@ -317,6 +324,7 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
+            self.worker.inproc_engine = inproc_engine
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         kv_cache_config = kv_cache_configs[self.global_rank]

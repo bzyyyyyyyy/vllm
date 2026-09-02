@@ -389,7 +389,14 @@ class ElasticEPScalingState:
         new_dp_group = self.new_dp_group
         self.engine_core.dp_group = new_dp_group
         self.engine_core.dp_rank = new_dp_group.rank()
+        self.engine_core.dp_size = new_dp_group.size()
         self.engine_core.dp_store = self.new_dp_store
+        if self.engine_core.enable_fault_tolerance:
+            # The replacement DP store is a fresh key space. Retained engines
+            # may have completed a different number of prior FT recoveries
+            # than newly-added engines, so all ranks must restart the key epoch
+            # together before another recovery can build its Gloo groups.
+            self.engine_core.ft_sentinel.reset_dp_reinit_epoch()
         engines_running = int(self.engine_core.engines_running)
         current_wave = self.engine_core.current_wave
         step_counter = self.engine_core.step_counter

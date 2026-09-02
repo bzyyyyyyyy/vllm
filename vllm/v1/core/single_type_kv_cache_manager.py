@@ -102,6 +102,10 @@ class SingleTypeKVCacheManager(ABC):
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
 
+        # Hard pins retain the request-owned block reference after the request
+        # leaves the scheduling queues.
+        self.pin_id_to_blocks: dict[str, list[KVCacheBlock]] = {}
+
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
@@ -525,6 +529,35 @@ class SingleTypeKVCacheManager(ABC):
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
         self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+
+    def pin_request_blocks(self, pin_id: str, request_id: str) -> list[int]:
+        """Transfer a request's KV ownership to a hard pin."""
+        self.validate_pin_request_blocks(pin_id, request_id)
+
+        blocks = self.pop_blocks_for_free(request_id)
+        self.pin_id_to_blocks[pin_id] = blocks
+        return [block.block_id for block in blocks if not block.is_null]
+
+    def validate_pin_request_blocks(self, pin_id: str, request_id: str) -> None:
+        """Validate a full ownership transfer without mutating state."""
+        if pin_id in self.pin_id_to_blocks:
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        if request_id not in self.req_to_blocks:
+            raise ValueError(f"request does not own KV blocks: {request_id!r}")
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        """Release a hard pin, returning its references to the block pool."""
+        blocks = self.pin_id_to_blocks.pop(pin_id, None)
+        if blocks is None:
+            return False
+        self.block_pool.free_blocks(reversed(blocks))
+        return True
+
+    def has_pinned_prefixes(self) -> bool:
+        return bool(self.pin_id_to_blocks)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return pin_id in self.pin_id_to_blocks
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

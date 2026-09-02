@@ -362,6 +362,11 @@ class RequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
     FINISHED_REPETITION = enum.auto()
+    # GCC extension states use reserved non-positive values so adding them does
+    # not renumber upstream statuses serialized by out-of-tree integrations.
+    # Both remain below PREEMPTED and therefore unfinished for is_finished().
+    WAITING_FOR_PREFIX = 0
+    PAUSED = -1
 
     def __str__(self) -> str:
         return self.name

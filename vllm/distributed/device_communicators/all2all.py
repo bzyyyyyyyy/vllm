@@ -403,6 +403,11 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         self.support_fault_tolerance = True
 
         self.max_num_ep_ranks = envs.VLLM_NIXL_EP_MAX_NUM_RANKS
+        if self.world_size > self.max_num_ep_ranks:
+            raise ValueError(
+                f"NIXL EP world size {self.world_size} exceeds "
+                f"VLLM_NIXL_EP_MAX_NUM_RANKS={self.max_num_ep_ranks}"
+            )
 
     def _init_buffer(
         self,
@@ -441,6 +446,11 @@ class NixlEPAll2AllManager(All2AllManagerBase):
 
     def _connect_to_ep_size(self, ep_size: int, *, make_active: bool) -> None:
         assert NixlEPAll2AllManager._buffer is not None
+        if ep_size > self.max_num_ep_ranks:
+            raise ValueError(
+                f"NIXL EP target size {ep_size} exceeds "
+                f"VLLM_NIXL_EP_MAX_NUM_RANKS={self.max_num_ep_ranks}"
+            )
         state = NixlEPAll2AllManager._buffer
         if ep_size <= state.connected_ep_size:
             return

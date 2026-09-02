@@ -167,9 +167,13 @@ def test_driver_nixl_side_channel_host_does_not_leak_to_engine_core_actor(
     created_placement_groups: list[Any] = []
     manager: CoreEngineActorManager | None = None
 
-    def create_dp_placement_groups(vllm_config: Any):
+    def create_dp_placement_groups(
+        vllm_config: Any, on_created=None
+    ):
         pg = _make_cpu_placement_group()
         created_placement_groups.append(pg)
+        if on_created is not None:
+            on_created(pg, True)
         return [pg], [0]
 
     monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_HOST", driver_marker)
@@ -272,10 +276,15 @@ def test_ray_dp_addresses_resolved_before_actor_creation(
     """
     created_placement_groups: list[Any] = []
 
-    def create_dp_placement_groups(vllm_config: Any):
+    def create_dp_placement_groups(
+        vllm_config: Any, on_created=None
+    ):
         pg1 = _make_cpu_placement_group()
         pg2 = _make_cpu_placement_group()
         created_placement_groups.extend([pg1, pg2])
+        if on_created is not None:
+            on_created(pg1, True)
+            on_created(pg2, False)
         return [pg1, pg2], [0, 0]
 
     monkeypatch.setattr("vllm.v1.engine.core.EngineCoreActor", _StubEngineCoreActor)

@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -27,7 +28,6 @@ from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
 )
-from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -65,6 +65,8 @@ from vllm.v1.engine import (
     EngineCoreRequestType,
     FinishReason,
     PauseMode,
+    PrefixPinResult,
+    PrefixPinTier,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
@@ -110,7 +112,13 @@ class EngineCore:
         log_stats: bool,
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
+        inproc_engine: bool = False,
     ):
+        # Set process-global ownership markers before any fallible startup
+        # work so partial-construction teardown remains conservative.
+        self.inproc_engine = inproc_engine
+        self._owns_envs_cache = False
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -129,7 +137,14 @@ class EngineCore:
         self._weight_version = "default"
 
         # Setup Model.
-        self.model_executor = executor_class(vllm_config)
+        if inproc_engine:
+            # AsyncInprocClient validates that this is a UniProcExecutor. Pass
+            # ownership information through to its in-process worker so it
+            # does not mutate process-global lifecycle state that belongs to
+            # the embedding application.
+            self.model_executor = executor_class(vllm_config, inproc_engine=True)
+        else:
+            self.model_executor = executor_class(vllm_config)
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
@@ -239,12 +254,25 @@ class EngineCore:
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
-        freeze_gc_heap()
+        self._freeze_gc_heap_if_owned()
         # If enable, attach GC debugger after static variable freeze.
-        maybe_attach_gc_debug_callback()
+        self._attach_gc_debug_callback_if_owned()
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
-        enable_envs_cache()
+        self._enable_envs_cache_with_ownership()
+
+    def _freeze_gc_heap_if_owned(self) -> None:
+        """Freeze only in a process dedicated to this EngineCore."""
+        if not self.inproc_engine:
+            freeze_gc_heap()
+
+    def _attach_gc_debug_callback_if_owned(self) -> None:
+        if not self.inproc_engine:
+            maybe_attach_gc_debug_callback()
+
+    def _enable_envs_cache_with_ownership(self) -> None:
+        transitioned = envs._enable_envs_cache_with_ownership()
+        self._owns_envs_cache = self.inproc_engine and transitioned
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -489,6 +517,45 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def pin_prefix(
+        self,
+        pin_id: str,
+        request: EngineCoreRequest,
+        tier: PrefixPinTier = "gpu",
+    ) -> Future[PrefixPinResult]:
+        """Prefill and retain the hash-aligned prefix of a request."""
+        scheduler_request, _ = self.preprocess_add_request(request)
+        return self.scheduler.pin_prefix(pin_id, scheduler_request, tier)
+
+    def unpin_prefix(
+        self, pin_id: str, expected_request_id: str | None = None
+    ) -> bool:
+        """Release a retained prefix, if present."""
+        return self.scheduler.unpin_prefix(pin_id, expected_request_id)
+
+    def pause_prefix(self, pin_id: str) -> Future[None]:
+        """Pause an in-progress prefix prefill without releasing its KV."""
+        return self.scheduler.pause_prefix(pin_id)
+
+    def resume_prefix(self, pin_id: str) -> Future[None]:
+        """Resume an in-progress prefix prefill."""
+        return self.scheduler.resume_prefix(pin_id)
+
+    def pause_requests(self, request_ids: list[str]) -> Future[None]:
+        """Pause requests after any already-submitted model step completes.
+
+        Completion fences subsequent scheduling, not delivery of output that
+        the completed step already produced.
+        """
+        return self.scheduler.pause_requests(request_ids)
+
+    def resume_requests(self, request_ids: list[str]) -> Future[None]:
+        """Resume requests from their retained KV state."""
+        return self.scheduler.resume_requests(request_ids)
+
+    def get_paused_request_ids(self) -> tuple[str, ...]:
+        return self.scheduler.get_paused_request_ids()
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -750,21 +817,57 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
-        if self.scheduler:
-            self.scheduler.shutdown()
+        errors: list[Exception] = []
+
+        def cleanup_resource(name: str, cleanup: Callable[[], Any]) -> None:
+            try:
+                cleanup()
+            except Exception as error:
+                logger.exception("EngineCore failed to clean up %s", name)
+                errors.append(error)
+
+        # getattr makes cleanup safe when construction failed after creating
+        # only a subset of EngineCore's resources.
+        structured_output_manager = getattr(
+            self, "structured_output_manager", None
+        )
+        if structured_output_manager is not None:
+            cleanup_resource(
+                "structured output manager", structured_output_manager.clear_backend
+            )
+        model_executor = getattr(self, "model_executor", None)
+        if model_executor is not None:
+            cleanup_resource("model executor", model_executor.shutdown)
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None:
+            cleanup_resource("scheduler", scheduler.shutdown)
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
         # visible to the garbage collector again. Without this, deleting
         # the engine in-process (e.g. unit tests) leaks GPU memory.
-        gc.unfreeze()
+        inproc_engine = getattr(self, "inproc_engine", False)
+        if not inproc_engine:
+            cleanup_resource("frozen GC heap", gc.unfreeze)
+        reset_envs_cache = not inproc_engine or getattr(
+            self, "_owns_envs_cache", False
+        )
+        if inproc_engine:
+            # Consume this ownership exactly once, including when later
+            # distributed cleanup stages fail and shutdown is retried.
+            self._owns_envs_cache = False
         # Tear down distributed state initialized in this EngineCore process
         # before it exits and release cached memory.
-        cleanup_dist_env_and_memory()
+        cleanup_resource(
+            "distributed environment",
+            lambda: cleanup_dist_env_and_memory(
+                unfreeze_gc=not inproc_engine,
+                reset_envs_cache=reset_envs_cache,
+            ),
+        )
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
+        if errors:
+            raise errors[0]
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
@@ -819,12 +922,59 @@ class EngineCore:
         # reset_connector=True so external connectors clear alongside
         # local caches, matching the pause_generation(clear_cache=True)
         # contract. No-op when no connector is configured.
-        self.reset_prefix_cache(
+        reset_successful = self.reset_prefix_cache(
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
         )
+        if not reset_successful:
+            raise RuntimeError(
+                "Cannot reset the prefix cache while pinned prefixes or paused "
+                "requests retain KV cache"
+            )
         self.reset_mm_cache()
         self.reset_encoder_cache()
+
+    def _can_reset_cache_for_pause(
+        self,
+        reset_running_requests: bool = True,
+        reset_connector: bool = True,
+        pause_mode: PauseMode | None = None,
+    ) -> bool:
+        allowed = self.scheduler.can_reset_prefix_cache(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+        if allowed and pause_mode == "wait":
+            # A resumable request can leave RUNNING after its current chunk and
+            # retain KV as WAITING_FOR_STREAMING. PAUSED_NEW intentionally does
+            # not count that queue as runnable work, so allowing it through a
+            # wait+clear preflight could make the eventual reset fail after the
+            # lifecycle state already changed.
+            requests = getattr(self.scheduler, "requests", {}).values()
+            allowed = not any(
+                getattr(request, "resumable", False) and not request.is_finished()
+                for request in requests
+            )
+        return allowed
+
+    def _check_cache_reset_allowed(
+        self,
+        reset_running_requests: bool = True,
+        reset_connector: bool = True,
+        pause_mode: PauseMode | None = None,
+    ) -> None:
+        """Reject destructive cache operations before lifecycle state changes."""
+        if not self._can_reset_cache_for_pause(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+            pause_mode=pause_mode,
+        ):
+            raise RuntimeError(
+                "Cannot clear caches while pinned prefixes or paused requests "
+                "retain KV cache, or while a resumable streaming request may "
+                "retain KV during a wait pause; release that ownership before "
+                "sleeping"
+            )
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -841,19 +991,32 @@ class EngineCore:
           optionally clear caches, then complete the returned Future.
         - ``keep``: Set PAUSED_ALL; return a Future that completes when the
           output queue is empty.
+
+        Completion prevents subsequent scheduling, but output from an
+        already-executed step may still be delivered to the frontend later.
         """
         if mode not in ("keep", "abort", "wait"):
             raise ValueError(f"Invalid pause mode: {mode}")
         if mode == "wait":
             raise ValueError("'wait' mode can't be used in inproc-engine mode")
 
+        previous_pause_state = self.scheduler.pause_state
+        if clear_cache:
+            self._check_cache_reset_allowed(
+                reset_running_requests=mode != "keep", pause_mode=mode
+            )
+
         if mode == "abort":
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)
-        if clear_cache:
-            self._reset_caches()
+        try:
+            if clear_cache:
+                self._reset_caches()
+        except Exception:
+            self.scheduler.set_pause_state(previous_pause_state)
+            raise
 
         return None
 
@@ -1850,14 +2013,30 @@ class EngineCoreProc(EngineCore):
           optionally clear caches, then complete the returned Future.
         - ``keep``: Set PAUSED_ALL; return a Future that completes when the
           output queue is empty.
+
+        Completion prevents subsequent scheduling, but output from an
+        already-executed step may still be delivered to the frontend later.
         """
         if mode not in ("keep", "abort", "wait"):
             raise ValueError(f"Invalid pause mode: {mode}")
 
+        previous_pause_state = self.scheduler.pause_state
+        if clear_cache:
+            self._check_cache_reset_allowed(
+                reset_running_requests=mode != "keep", pause_mode=mode
+            )
+
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
-            if clear_cache:
-                engine._reset_caches()
-            future.set_result(None)
+            try:
+                if clear_cache:
+                    engine._reset_caches()
+            except Exception as error:
+                engine.scheduler.set_pause_state(previous_pause_state)
+                if not future.done():
+                    future.set_exception(error)
+            else:
+                if not future.done():
+                    future.set_result(None)
 
         if mode == "abort":
             aborted_reqs = self.scheduler.finish_requests(
@@ -1869,8 +2048,12 @@ class EngineCoreProc(EngineCore):
         self.scheduler.set_pause_state(pause_state)
 
         if self._pause_complete():
-            if clear_cache:
-                self._reset_caches()
+            try:
+                if clear_cache:
+                    self._reset_caches()
+            except Exception:
+                self.scheduler.set_pause_state(previous_pause_state)
+                raise
             return None
 
         future = Future[Any]()
@@ -1915,6 +2098,68 @@ class EngineCoreProc(EngineCore):
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
 
 
+class _DPControlOpKind(IntEnum):
+    RESET = 1
+    PAUSE = 2
+    RESUME = 3
+    SLEEP = 4
+    WAKE = 5
+
+
+class _DPControlOpPhase(IntEnum):
+    PREFLIGHT = 1
+    DRAINING = 2
+
+
+_DP_CONTROL_PARTIAL_CHECKPOINT_LIMIT = 8
+_DP_CONTROL_PARTIAL_TIMEOUT_S = 5.0
+_DP_CONTROL_IDLE_YIELD_S = 0.001
+
+
+@dataclass(slots=True)
+class _DPControlOp:
+    kind: _DPControlOpKind
+    reset_running_requests: bool
+    reset_connector: bool
+    clear_cache: bool
+    pause_mode: PauseMode | None
+    sleep_level: int
+    wake_tags: tuple[str, ...] | None
+    future: Future[Any]
+    state_blocked: bool
+    phase: _DPControlOpPhase = _DPControlOpPhase.PREFLIGHT
+
+    @property
+    def signature(self) -> int:
+        # Keep the packed value small enough that signature**2 is exact in the
+        # int64 cadence tensor. Each combination of kind and public parameters
+        # has a distinct value.
+        pause_mode = {None: 0, "abort": 1, "wait": 2, "keep": 3}[self.pause_mode]
+        wake_tags = {
+            None: 0,
+            (): 1,
+            ("weights",): 2,
+            ("kv_cache",): 3,
+            ("kv_cache", "weights"): 4,
+        }[self.wake_tags]
+        return (
+            int(self.kind)
+            | int(self.reset_running_requests) << 3
+            | int(self.reset_connector) << 4
+            | int(self.clear_cache) << 5
+            | pause_mode << 6
+            | self.sleep_level << 8
+            | wake_tags << 10
+        )
+
+
+@dataclass(slots=True)
+class _DPControlCompletion:
+    operation: _DPControlOp
+    result: Any = None
+    error: BaseException | None = None
+
+
 class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
     in a data parallel context."""
@@ -1948,6 +2193,11 @@ class DPEngineCoreProc(EngineCoreProc):
         # START_DP_WAVE messages cannot re-wake the engines.
         self.pending_pause = False
         self.ignore_start_dp_wave = False
+        self._pending_dp_control_op: _DPControlOp | None = None
+        self._pending_dp_control_completion: _DPControlCompletion | None = None
+        self._dp_control_partial_checkpoints = 0
+        self._dp_control_partial_started_at: float | None = None
+        self._dp_control_partial_active = False
 
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
@@ -1965,6 +2215,20 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
         )
+        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            self._align_new_elastic_ep_rank_pause_state()
+
+    def _align_new_elastic_ep_rank_pause_state(self) -> None:
+        """Match old ranks before joining a paused scale-up DP group."""
+        self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        self.pending_pause = False
+        self.ignore_start_dp_wave = True
+        self._pending_dp_control_op = None
+        self._pending_dp_control_completion = None
+        self._dp_control_partial_checkpoints = 0
+        self._dp_control_partial_started_at = None
+        self._dp_control_partial_active = False
+        self.engines_running = False
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
@@ -1983,9 +2247,312 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_group, self.dp_store = dp_group, dp_store
 
     def shutdown(self):
-        super().shutdown()
-        if dp_group := getattr(self, "dp_group", None):
-            stateless_destroy_torch_distributed_process_group(dp_group)
+        primary_error: BaseException | None = None
+        try:
+            super().shutdown()
+        except BaseException as error:
+            primary_error = error
+
+        dp_group = getattr(self, "dp_group", None)
+        if dp_group is not None:
+            try:
+                stateless_destroy_torch_distributed_process_group(dp_group)
+                self.dp_group = None
+            except BaseException:
+                if primary_error is None:
+                    raise
+                logger.exception(
+                    "Failed to destroy the stateless DP process group after "
+                    "EngineCore shutdown failed"
+                )
+
+        if primary_error is not None:
+            raise primary_error
+
+    def _wake_dp_wave_for_control(self) -> None:
+        """Enter the cadence loop after registering a collective control op."""
+        if self.engines_running:
+            return
+        self.engines_running = True
+        if self.has_coordinator:
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(start_wave=self.current_wave))
+            )
+
+    def _submit_dp_control_op(
+        self,
+        kind: _DPControlOpKind,
+        *,
+        reset_running_requests: bool,
+        reset_connector: bool,
+        clear_cache: bool = False,
+        pause_mode: PauseMode | None = None,
+        sleep_level: int = 0,
+        wake_tags: tuple[str, ...] | None = None,
+    ) -> Future[Any]:
+        """Publish lifecycle intent for the next fixed-cadence collective."""
+        if kind in (_DPControlOpKind.RESUME, _DPControlOpKind.WAKE):
+            state_blocked = not (
+                not getattr(self, "pending_pause", False)
+                and getattr(self, "ignore_start_dp_wave", False)
+                and self.scheduler.pause_state != PauseState.UNPAUSED
+            )
+        else:
+            state_blocked = not (
+                not getattr(self, "pending_pause", False)
+                and not getattr(self, "ignore_start_dp_wave", False)
+                and self.scheduler.pause_state == PauseState.UNPAUSED
+            )
+        operation = _DPControlOp(
+            kind=kind,
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+            clear_cache=clear_cache,
+            pause_mode=pause_mode,
+            sleep_level=sleep_level,
+            wake_tags=wake_tags,
+            future=Future(),
+            state_blocked=state_blocked,
+        )
+        pending = cast(
+            _DPControlOp | None, getattr(self, "_pending_dp_control_op", None)
+        )
+        if pending is not None:
+            if pending.signature == operation.signature:
+                # DPLB retries can deliver the same utility more than once.
+                # Sharing the Future makes the operation idempotent until it
+                # reaches a terminal result.
+                return pending.future
+            operation.future.set_exception(
+                RuntimeError("A different DP lifecycle operation is pending")
+            )
+            return operation.future
+
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            not self.has_coordinator
+            or parallel_config.data_parallel_external_lb
+            or parallel_config.data_parallel_hybrid_lb
+        ):
+            operation.future.set_exception(
+                RuntimeError(
+                    "Global DP lifecycle controls are not supported through "
+                    "external-LB/SPMD or hybrid-DP endpoints; use a pure "
+                    "internal coordinator-broadcast DP client"
+                )
+            )
+            return operation.future
+
+        self._pending_dp_control_op = operation
+        self._wake_dp_wave_for_control()
+        return operation.future
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool | Future[bool]:
+        # The utility dispatcher understands Future results. Registering intent
+        # here is deliberately collective-free; the decision is made by the
+        # fixed-shape synchronization in `_has_global_unfinished_reqs`.
+        return self._submit_dp_control_op(
+            _DPControlOpKind.RESET,
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+
+    def pause_scheduler(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> Future | None:
+        """Register a globally coordinated pause intent.
+
+        Completion prevents subsequent scheduling, but output from an
+        already-executed step may still be delivered to the frontend later.
+        """
+        if mode not in ("keep", "abort", "wait"):
+            raise ValueError(f"Invalid pause mode: {mode}")
+        # Every DP pause participates in the descriptor protocol, including
+        # no-clear pauses. Otherwise different frontend FIFO order could apply
+        # incompatible pause modes on different ranks.
+        return self._submit_dp_control_op(
+            _DPControlOpKind.PAUSE,
+            reset_running_requests=clear_cache and mode != "keep",
+            reset_connector=clear_cache,
+            clear_cache=clear_cache,
+            pause_mode=mode,
+        )
+
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> Future[Any]:
+        if level not in (0, 1, 2):
+            raise ValueError(f"Invalid sleep level: {level}")
+        if mode not in ("keep", "abort", "wait"):
+            raise ValueError(f"Invalid pause mode: {mode}")
+        clear_cache = level >= 1
+        return self._submit_dp_control_op(
+            _DPControlOpKind.SLEEP,
+            reset_running_requests=clear_cache and mode != "keep",
+            reset_connector=clear_cache,
+            clear_cache=clear_cache,
+            pause_mode=mode,
+            sleep_level=level,
+        )
+
+    def _get_dp_control_sync_fields(self) -> tuple[bool, bool, int]:
+        operation = cast(
+            _DPControlOp | None, getattr(self, "_pending_dp_control_op", None)
+        )
+        if operation is None:
+            return False, False, 0
+        if operation.phase == _DPControlOpPhase.DRAINING:
+            # Negative signatures distinguish an already-committed drain from
+            # a recoverable, as-yet-uncommitted partial broadcast without
+            # changing the fixed collective shape.
+            return True, False, -operation.signature
+        if operation.phase != _DPControlOpPhase.PREFLIGHT:
+            return False, False, 0
+        if operation.state_blocked:
+            allowed = False
+        elif operation.kind in (_DPControlOpKind.RESUME, _DPControlOpKind.WAKE):
+            allowed = True
+        elif operation.kind in (
+            _DPControlOpKind.PAUSE,
+            _DPControlOpKind.SLEEP,
+        ):
+            allowed = not operation.clear_cache or self._can_reset_cache_for_pause(
+                reset_running_requests=operation.reset_running_requests,
+                reset_connector=operation.reset_connector,
+                pause_mode=operation.pause_mode,
+            )
+        else:
+            allowed = self.scheduler.can_reset_prefix_cache(
+                reset_running_requests=operation.reset_running_requests,
+                reset_connector=operation.reset_connector,
+            )
+        return True, not allowed, operation.signature
+
+    def _clear_dp_control_op(self, operation: _DPControlOp) -> None:
+        if getattr(self, "_pending_dp_control_op", None) is operation:
+            self._pending_dp_control_op = None
+
+    def _stage_dp_control_completion(
+        self,
+        operation: _DPControlOp,
+        *,
+        result: Any = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if getattr(self, "_pending_dp_control_completion", None) is not None:
+            raise RuntimeError("A DP lifecycle completion is already staged")
+        self._pending_dp_control_completion = _DPControlCompletion(
+            operation=operation,
+            result=result,
+            error=error,
+        )
+
+    def _publish_dp_control_completion(self) -> None:
+        """Resolve a lifecycle Future only after cadence state is committed."""
+        completion = getattr(self, "_pending_dp_control_completion", None)
+        if completion is None:
+            return
+        operation = completion.operation
+        if getattr(self, "_pending_dp_control_op", None) is not operation:
+            raise RuntimeError("Staged DP lifecycle completion lost its operation")
+        self._pending_dp_control_completion = None
+        self._clear_dp_control_op(operation)
+        if completion.error is not None:
+            operation.future.set_exception(completion.error)
+        else:
+            operation.future.set_result(completion.result)
+
+    def _reject_dp_control_op(
+        self, operation: _DPControlOp, message: str, *, blocked: bool
+    ) -> None:
+        if operation.kind == _DPControlOpKind.RESET and blocked:
+            self._stage_dp_control_completion(operation, result=False)
+        else:
+            self._stage_dp_control_completion(
+                operation, error=RuntimeError(message)
+            )
+
+    def _apply_drained_dp_pause(self, operation: _DPControlOp) -> None:
+        """Apply cache clearing at a globally-idle cadence checkpoint.
+
+        A False result or exception violates the unanimous, read-only
+        preflight invariant. Let it escape the engine loop so every frontend
+        observes engine failure; rolling one rank back to UNPAUSED would create
+        a hidden split-brain lifecycle.
+        """
+        if operation.clear_cache:
+            reset_successful = EngineCore.reset_prefix_cache(
+                self, reset_running_requests=True, reset_connector=True
+            )
+            if not reset_successful:
+                raise RuntimeError(
+                    "DP cache reset invariant violated after unanimous preflight"
+                )
+            self.reset_mm_cache()
+            self.reset_encoder_cache()
+        if operation.kind == _DPControlOpKind.SLEEP and operation.sleep_level >= 1:
+            self.model_executor.sleep(operation.sleep_level)
+        self._stage_dp_control_completion(operation)
+
+    def _commit_dp_control_op(self, operation: _DPControlOp) -> bool:
+        """Apply a unanimously preflighted operation on the engine thread.
+
+        Returns True when the current DP wave must remain active for a drain or
+        post-resume work-discovery phase.
+        """
+        if operation.kind == _DPControlOpKind.RESET:
+            reset = EngineCore.reset_prefix_cache(
+                self,
+                reset_running_requests=operation.reset_running_requests,
+                reset_connector=operation.reset_connector,
+            )
+            if not reset:
+                raise RuntimeError(
+                    "DP cache reset invariant violated after unanimous preflight"
+                )
+            self._stage_dp_control_completion(operation, result=True)
+            return False
+
+        if operation.kind == _DPControlOpKind.RESUME:
+            self.scheduler.set_pause_state(PauseState.UNPAUSED)
+            self.ignore_start_dp_wave = False
+            self._stage_dp_control_completion(operation)
+            # local_work was sampled while every scheduler was still paused.
+            # Keep all ranks alive until one more cadence observes real work.
+            return True
+
+        if operation.kind == _DPControlOpKind.WAKE:
+            if operation.wake_tags != ():
+                tags = (
+                    None
+                    if operation.wake_tags is None
+                    else list(operation.wake_tags)
+                )
+                self.model_executor.wake_up(tags)
+            fully_awake = not self.model_executor.is_sleeping
+            if fully_awake:
+                self.scheduler.set_pause_state(PauseState.UNPAUSED)
+                self.ignore_start_dp_wave = False
+            self._stage_dp_control_completion(operation)
+            return fully_awake
+
+        assert operation.pause_mode is not None
+        if operation.pause_mode == "abort":
+            aborted_reqs = self.scheduler.finish_requests(
+                None, RequestStatus.FINISHED_ABORTED
+            )
+            self._send_abort_outputs(aborted_reqs)
+
+        pause_state = (
+            PauseState.PAUSED_ALL
+            if operation.pause_mode == "keep"
+            else PauseState.PAUSED_NEW
+        )
+        self.scheduler.set_pause_state(pause_state)
+        operation.phase = _DPControlOpPhase.DRAINING
+        self.pending_pause = True
+        self.engines_running = True
+        return True
 
     def _pause_complete(self) -> bool:
         """Two-phase DP-aware pause.
@@ -2021,30 +2588,107 @@ class DPEngineCoreProc(EngineCoreProc):
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
-    def resume_scheduler(self):
-        if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
-            raise RuntimeError(
-                "resume_scheduler called while pause is still in "
-                "flight. Wait for the pause future to resolve before "
-                "resuming."
-            )
-        if self.engines_running:
-            logger.debug("Resume called while engines are not paused, ignoring.")
+    def _wake_dp_wave_for_local_work(self) -> None:
+        """Wake an idle DP engine after a utility creates local work."""
+        if (
+            self.engines_running
+            or getattr(self, "pending_pause", False)
+            or getattr(self, "ignore_start_dp_wave", False)
+            or self.scheduler.pause_state != PauseState.UNPAUSED
+            or not self.scheduler.has_requests()
+        ):
             return
 
-        super().resume_scheduler()
-        self.ignore_start_dp_wave = False
+        # External-LB ranks also need their local loop made runnable. Without
+        # this transition connector-only work can remain invisible to the
+        # `has_unfinished_requests()` idle fast path forever.
+        self.engines_running = True
+        if self.has_coordinator:
+            # Match the established late-request handshake by additionally
+            # asking the coordinator to wake every peer.
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(start_wave=self.current_wave))
+            )
 
-        # Barrier: wait for all DP ranks to have resumed (and cleared
-        # ignore_start_dp_wave) before any rank starts stepping. Uses
-        # the existing all-reduce which is safe because engines are
-        # stopped.
-        has_global_unfinished = ParallelConfig.has_unfinished_dp(
-            self.dp_group, self.scheduler.has_unfinished_requests()
+    def _ensure_dp_kv_utility_allowed(self, operation: str) -> None:
+        if (
+            getattr(self, "_pending_dp_control_op", None) is not None
+            or getattr(self, "pending_pause", False)
+            or getattr(self, "ignore_start_dp_wave", False)
+            or self.scheduler.pause_state != PauseState.UNPAUSED
+        ):
+            raise RuntimeError(
+                f"{operation} cannot run during a DP cache or pause lifecycle "
+                "operation"
+            )
+
+    def abort_requests(self, request_ids: list[str]):
+        super().abort_requests(request_ids)
+        self._wake_dp_wave_for_local_work()
+
+    def pin_prefix(
+        self,
+        pin_id: str,
+        request: EngineCoreRequest,
+        tier: PrefixPinTier = "gpu",
+    ) -> Future[PrefixPinResult]:
+        self._ensure_dp_kv_utility_allowed("pin_prefix")
+        future = super().pin_prefix(pin_id, request, tier)
+        self._wake_dp_wave_for_local_work()
+        return future
+
+    def unpin_prefix(
+        self, pin_id: str, expected_request_id: str | None = None
+    ) -> bool:
+        unpinned = super().unpin_prefix(pin_id, expected_request_id)
+        self._wake_dp_wave_for_local_work()
+        return unpinned
+
+    def pause_prefix(self, pin_id: str) -> Future[None]:
+        self._ensure_dp_kv_utility_allowed("pause_prefix")
+        future = super().pause_prefix(pin_id)
+        self._wake_dp_wave_for_local_work()
+        return future
+
+    def resume_prefix(self, pin_id: str) -> Future[None]:
+        self._ensure_dp_kv_utility_allowed("resume_prefix")
+        future = super().resume_prefix(pin_id)
+        self._wake_dp_wave_for_local_work()
+        return future
+
+    def pause_requests(self, request_ids: list[str]) -> Future[None]:
+        self._ensure_dp_kv_utility_allowed("pause_requests")
+        future = super().pause_requests(request_ids)
+        self._wake_dp_wave_for_local_work()
+        return future
+
+    def resume_requests(self, request_ids: list[str]) -> Future[None]:
+        self._ensure_dp_kv_utility_allowed("resume_requests")
+        future = super().resume_requests(request_ids)
+        self._wake_dp_wave_for_local_work()
+        return future
+
+    def resume_scheduler(self) -> Future[Any]:
+        return self._submit_dp_control_op(
+            _DPControlOpKind.RESUME,
+            reset_running_requests=False,
+            reset_connector=False,
         )
 
-        if has_global_unfinished:
-            self.engines_running = True
+    def wake_up(self, tags: list[str] | None = None) -> Future[Any]:
+        """Wake executor memory and scheduling through one DP descriptor."""
+        if tags is not None and "scheduling" in tags:
+            tags = [tag for tag in tags if tag != "scheduling"]
+        wake_tags = None if tags is None else tuple(sorted(set(tags)))
+        supported_tags = {"weights", "kv_cache"}
+        if wake_tags is not None and not set(wake_tags).issubset(supported_tags):
+            raise ValueError(f"Invalid wake tags: {tags}")
+        return self._submit_dp_control_op(
+            _DPControlOpKind.WAKE,
+            reset_running_requests=False,
+            reset_connector=False,
+            wake_tags=wake_tags,
+        )
 
     def barrier(self):
         """Blocking barrier on the DP process group (test-only utility)."""
@@ -2098,6 +2742,26 @@ class DPEngineCoreProc(EngineCoreProc):
             and self.step_counter % self.prefill_schedule_interval != 0
         )
 
+    def _has_local_dp_work(self) -> bool:
+        # Connector transfers can outlive their internal scheduling request.
+        # Scheduler.has_requests() already excludes retained keep-paused
+        # requests through its pause-aware unfinished count while preserving
+        # finished cleanup and KV/EC connector pending push work.
+        return self.scheduler.has_requests()
+
+    def _yield_for_pending_dp_control(self, model_executed: bool) -> None:
+        """Avoid a tight dummy/idle loop while lifecycle admission converges."""
+        if not model_executed and (
+            getattr(self, "_pending_dp_control_op", None) is not None
+            or getattr(self, "_dp_control_partial_active", False)
+        ):
+            time.sleep(_DP_CONTROL_IDLE_YIELD_S)
+
+    def _reset_dp_control_partial_tracking(self) -> None:
+        self._dp_control_partial_checkpoints = 0
+        self._dp_control_partial_started_at = None
+        self._dp_control_partial_active = False
+
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -2125,6 +2789,7 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            local_dp_work = self._has_local_dp_work()
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
@@ -2142,9 +2807,8 @@ class DPEngineCoreProc(EngineCoreProc):
                         )
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs
-            )
+            self._has_global_unfinished_reqs(local_dp_work)
+            self._yield_for_pending_dp_control(model_executed=executed)
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
@@ -2168,24 +2832,142 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raise SystemExit
 
-    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+    def _has_global_unfinished_reqs(self, local_work: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
         if self.step_counter % 32 != 0:
+            self.engines_running = True
             return True
 
-        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
+        control_pending, control_blocked, control_signature = (
+            self._get_dp_control_sync_fields()
+        )
+        (
+            has_unfinished,
+            pause_count,
+            control_op_count,
+            control_blocked_count,
+            signature_sum,
+            signature_square_sum,
+        ) = ParallelConfig.sync_dp_state(
             self.dp_group,
-            has_unfinished=local_unfinished,
+            has_unfinished=local_work,
             pending_pause=self.pending_pause,
+            control_op_pending=control_pending,
+            control_op_blocked=control_blocked,
+            control_op_signature=control_signature,
         )
 
-        if pause_consensus:
+        operation = cast(
+            _DPControlOp | None, getattr(self, "_pending_dp_control_op", None)
+        )
+        if (
+            control_op_count
+            and control_op_count * signature_square_sum
+            != signature_sum * signature_sum
+        ):
+            # Every rank observes the same aggregate mismatch. Fail-stop on
+            # every rank so no participant can clear its descriptor while a
+            # peer continues waiting on a now-impossible consensus.
+            raise RuntimeError("DP ranks submitted different lifecycle operations")
+        if control_op_count == self.dp_size:
+            self._reset_dp_control_partial_tracking()
+            if operation is None:
+                raise RuntimeError(
+                    "DP lifecycle consensus reached without local intent"
+                )
+            local_sync_signature = (
+                -operation.signature
+                if operation.phase == _DPControlOpPhase.DRAINING
+                else operation.signature
+            )
+            expected_signature_sum = local_sync_signature * self.dp_size
+            expected_signature_square_sum = (
+                local_sync_signature * local_sync_signature * self.dp_size
+            )
+            if (
+                signature_sum != expected_signature_sum
+                or signature_square_sum != expected_signature_square_sum
+            ):
+                raise RuntimeError(
+                    "DP lifecycle consensus does not match local intent"
+                )
+            if operation.phase == _DPControlOpPhase.PREFLIGHT:
+                if control_blocked_count:
+                    self._reject_dp_control_op(
+                        operation,
+                        "DP lifecycle preflight was rejected by a DP rank due "
+                        "to scheduler state or retained pinned, paused, "
+                        "streaming, or unsynchronized KV ownership",
+                        blocked=True,
+                    )
+                else:
+                    has_unfinished = (
+                        self._commit_dp_control_op(operation) or has_unfinished
+                    )
+            elif operation.phase == _DPControlOpPhase.DRAINING:
+                if control_blocked_count:
+                    raise RuntimeError(
+                        "DP pause drain descriptor unexpectedly reported a blocker"
+                    )
+                if not has_unfinished:
+                    self._apply_drained_dp_pause(operation)
+            else:
+                raise RuntimeError("Invalid DP lifecycle operation phase")
+        elif control_op_count:
+            # Some ranks have not received the broadcast operation yet. Keep
+            # every participating wave alive until the fixed cadence reports
+            # either unanimity or a signature mismatch.
+            if signature_sum < 0:
+                raise RuntimeError(
+                    "A committed DP lifecycle operation became partial"
+                )
+            self._dp_control_partial_active = True
+            now = time.monotonic()
+            partial_started_at = getattr(
+                self, "_dp_control_partial_started_at", None
+            )
+            if partial_started_at is None:
+                partial_started_at = now
+                self._dp_control_partial_started_at = partial_started_at
+            partial_checkpoints = (
+                getattr(self, "_dp_control_partial_checkpoints", 0) + 1
+            )
+            self._dp_control_partial_checkpoints = partial_checkpoints
+            if (
+                partial_checkpoints >= _DP_CONTROL_PARTIAL_CHECKPOINT_LIMIT
+                and now - partial_started_at >= _DP_CONTROL_PARTIAL_TIMEOUT_S
+            ):
+                # This descriptor has not changed scheduler/executor state yet.
+                # Require both a cadence floor and real elapsed time so a fast
+                # idle loop cannot outrun cross-node frontend admission.
+                # Participants detach their local intent without mutation;
+                # a descriptor delivered later enters a fresh partial wave.
+                self._reset_dp_control_partial_tracking()
+                if operation is not None:
+                    self._reject_dp_control_op(
+                        operation,
+                        "DP lifecycle broadcast did not reach every rank",
+                        blocked=False,
+                    )
+            has_unfinished = True
+        else:
+            self._reset_dp_control_partial_tracking()
+
+        if pause_count == self.dp_size:
             self.ignore_start_dp_wave = True
             self.pending_pause = False
             logger.debug("DP pause consensus reached, ignoring START_DP_WAVE.")
+        elif pause_count:
+            has_unfinished = True
 
-        return has_unfinished
+        # Commit the old cadence result before resolving its Future. Future
+        # callbacks run synchronously and the frontend may immediately submit
+        # the next lifecycle operation from another thread; that operation must
+        # observe the terminal state and must not be overwritten by this wave.
+        self.engines_running = has_unfinished
+        self._publish_dp_control_completion()
+        return self.engines_running
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
@@ -2248,6 +3030,27 @@ class DPEngineCoreProc(EngineCoreProc):
         state.commit_requested = True
         self.process_input_queue_block = False
         logger.info("[Elastic EP] Committing prepared reconfiguration")
+
+    def abort_for_elastic_ep_scale_down(self, new_data_parallel_size: int) -> None:
+        """Abort retained requests on a rank selected for scale-down removal."""
+        if (
+            not self.vllm_config.parallel_config.enable_elastic_ep
+            or self.dp_rank < new_data_parallel_size
+        ):
+            raise RuntimeError("Rank is not selected for elastic EP removal")
+        if (
+            self.scheduler.pause_state != PauseState.PAUSED_ALL
+            or self.pending_pause
+            or not self.ignore_start_dp_wave
+            or self._pending_dp_control_op is not None
+        ):
+            raise RuntimeError(
+                "Elastic EP removal abort requires a completed keep-pause"
+            )
+        aborted_reqs = self.scheduler.finish_requests(
+            None, RequestStatus.FINISHED_ABORTED
+        )
+        self._send_abort_outputs(aborted_reqs)
 
     def _eep_send_engine_core_notification(
         self, notification_type: EEPNotificationType

@@ -60,6 +60,10 @@ from .rebalance_execute import (
 
 logger = init_logger(__name__)
 
+# Logical-to-physical maps reserve one slot for the logical expert itself.
+# Keep this limit shared with elastic-EP target validation.
+MAX_EXPERT_REDUNDANCY = 1023
+
 
 @dataclass
 class EplbStats:
@@ -373,7 +377,6 @@ class EplbState:
         # Assuming 8 GPUs per node, this supports up to
         # (1023 + 1) / 8 = 128 nodes for now.
         # TODO(rui): make this configurable
-        MAX_EXPERT_REDUNDANCY = 1023
         assert model.num_redundant_experts <= MAX_EXPERT_REDUNDANCY, (
             f"num_redundant_experts {model.num_redundant_experts} "
             f"must be less than or equal to {MAX_EXPERT_REDUNDANCY}"

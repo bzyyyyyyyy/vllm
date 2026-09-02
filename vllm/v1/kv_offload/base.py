@@ -381,6 +381,50 @@ class OffloadingManager(ABC):
         """
         return False
 
+    def pin_prefix(
+        self,
+        pin_id: str,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> list[int]:
+        """Atomically reserve and hard-pin ``keys`` in this tier.
+
+        The returned IDs identify the tier-owned storage. A pin may initially
+        refer to write-pending data; callers use :meth:`is_prefix_pin_ready`
+        before releasing any source KV.
+        """
+        raise RuntimeError(
+            f"{type(self).__name__} does not support hard prefix pinning"
+        )
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        """Return whether all data retained by ``pin_id`` is readable."""
+        return False
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        """Return tier-owned block IDs retained by a hard prefix pin."""
+        raise KeyError(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        """Release a hard prefix pin, returning whether it existed."""
+        return False
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return False
+
+    def has_pinned_prefixes(self) -> bool:
+        return False
+
+    def is_prefix_key_pinned(self, key: OffloadKey) -> bool:
+        """Return whether ``key`` is retained by any hard prefix pin."""
+        return False
+
+    def get_prefix_pin_ids_for_keys(
+        self, keys: Collection[OffloadKey]
+    ) -> set[str]:
+        """Return hard-pin IDs which retain at least one of ``keys``."""
+        return set()
+
     def reset_cache(self) -> None:
         """Evict all tracked blocks and reset internal state."""
         return

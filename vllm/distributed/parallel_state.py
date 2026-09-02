@@ -2149,13 +2149,19 @@ def destroy_distributed_environment():
         torch.distributed.destroy_process_group()
 
 
-def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+def cleanup_dist_env_and_memory(
+    shutdown_ray: bool = False,
+    *,
+    unfreeze_gc: bool = True,
+    reset_envs_cache: bool = True,
+):
     logger.debug(
         "[shutdown] Distributed: cleanup start shutdown_ray=%s",
         shutdown_ray,
     )
-    # Reset environment variable cache
-    envs.disable_envs_cache()
+    # Reset only a cache transition owned by this engine/process.
+    if reset_envs_cache:
+        envs.disable_envs_cache()
 
     # Reset rocm_aiter_ops class variables to match current os.environ.
     # These are class-level attributes that persist across tests and are
@@ -2167,8 +2173,10 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
         rocm_aiter_ops.refresh_env_variables()
 
-    # Ensure all objects are not frozen before cleanup
-    gc.unfreeze()
+    # Child EngineCore processes own their GC heap. An owner-thread EngineCore
+    # shares the embedding application's heap and must not unfreeze it.
+    if unfreeze_gc:
+        gc.unfreeze()
 
     destroy_model_parallel()
     destroy_distributed_environment()

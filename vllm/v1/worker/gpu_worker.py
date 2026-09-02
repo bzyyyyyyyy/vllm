@@ -422,6 +422,8 @@ class Worker(WorkerBase):
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
+        self._propagate_process_ownership_to_model_runner()
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -839,9 +841,11 @@ class Worker(WorkerBase):
         )
 
         # Freeze the worker heap so the GC won't scan static objects
-        # (model weights, KV caches, CUDA graphs) during inference.
-        freeze_gc_heap()
-        maybe_attach_gc_debug_callback()
+        # (model weights, KV caches, CUDA graphs) during inference. An
+        # owner-thread worker shares the host application's GC heap and must
+        # not freeze it process-wide.
+        self._freeze_gc_heap_if_owned()
+        self._attach_gc_debug_callback_if_owned()
 
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
@@ -851,6 +855,21 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _freeze_gc_heap_if_owned(self) -> None:
+        if not self.inproc_engine:
+            freeze_gc_heap()
+
+    def _propagate_process_ownership_to_model_runner(self) -> None:
+        self.model_runner.inproc_engine = self.inproc_engine
+
+    def _attach_gc_debug_callback_if_owned(self) -> None:
+        if not self.inproc_engine:
+            maybe_attach_gc_debug_callback()
+
+    def _unfreeze_gc_heap_if_owned(self) -> None:
+        if not self.inproc_engine:
+            gc.unfreeze()
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
@@ -1313,7 +1332,7 @@ class Worker(WorkerBase):
             self._weight_update_active = False
 
     def shutdown(self) -> None:
-        gc.unfreeze()
+        self._unfreeze_gc_heap_if_owned()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

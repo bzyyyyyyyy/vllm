@@ -4,6 +4,7 @@
 import contextlib
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -83,6 +84,22 @@ class EngineHandshakeMetadata:
 
     addresses: EngineZmqAddresses
     parallel_config: dict[str, int | str | list[int]]
+
+
+@dataclass
+class ElasticEPScaleUpReservation:
+    """Placement groups reserved before existing EEP ranks are mutated."""
+
+    owner_id: int
+    old_data_parallel_size: int
+    new_data_parallel_size: int
+    placement_groups: list["PlacementGroup"]
+    local_dp_ranks: list[int]
+    state: str = "reserved"
+
+
+class ElasticEPScaleUpReservationError(RuntimeError):
+    """A failed reservation left Ray resources requiring shutdown cleanup."""
 
 
 def _make_control_bundle(node_ip: str) -> dict[str, float]:
@@ -170,7 +187,16 @@ class CoreEngineProcManager:
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_complete = False
+        # Only processes whose ``start()`` completed (or at least assigned a
+        # PID before raising) are safe to pass to multiprocessing's lifecycle
+        # APIs.  Keep this list mutable so the finalizer sees partial startup
+        # progress without ever touching an unstarted Process object.
+        self._started_processes: list[BaseProcess] = []
+        self._finalizer = weakref.finalize(
+            self, shutdown, self._started_processes
+        )
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -207,8 +233,24 @@ class CoreEngineProcManager:
                     dp_local_rank=local_dp_rank,
                     process_kind="EngineCore",
                 ):
-                    proc.start()
-        finally:
+                    try:
+                        proc.start()
+                    finally:
+                        if (
+                            proc.pid is not None
+                            and proc not in self._started_processes
+                        ):
+                            self._started_processes.append(proc)
+        except BaseException:
+            try:
+                self.shutdown()
+            except BaseException:
+                logger.exception(
+                    "EngineCore process cleanup failed during startup; the "
+                    "finalizer remains armed for retry"
+                )
+            raise
+        else:
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.shutdown()
@@ -216,8 +258,15 @@ class CoreEngineProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
-        if self._finalizer.detach() is not None:
-            shutdown(self.processes, timeout=timeout)
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            if not self._finalizer.alive:
+                self._shutdown_complete = True
+                return
+            shutdown(self._started_processes, timeout=timeout)
+            self._finalizer.detach()
+            self._shutdown_complete = True
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
@@ -382,11 +431,8 @@ class CoreEngineActorManager:
         placement_groups: list["PlacementGroup"] | None = None,
         local_dp_ranks: list[int] | None = None,
     ):
-        import copy
-
         import ray
         from ray.runtime_env import RuntimeEnv
-        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         from vllm.v1.engine.core import DPMoEEngineCoreActor, EngineCoreActor
 
@@ -399,6 +445,23 @@ class CoreEngineActorManager:
 
         self.local_engine_actors: list[ray.ActorHandle] = []
         self.remote_engine_actors: list[ray.ActorHandle] = []
+        self.created_placement_groups: list["PlacementGroup"] = []
+        self.placement_group_is_local: list[bool] = []
+        self.run_refs: list = []
+        self.actor_run_ref_dict: dict = {}
+        # Elastic scale-up runs in a frontend worker thread. Serialize every
+        # actor/placement-group mutation with shutdown so teardown cannot race
+        # a late append from an already-cancelled asyncio task.
+        self._actor_mutation_lock = threading.RLock()
+        self.manager_stopped = threading.Event()
+        self.failed_proc_name: str | None = None
+        self._finalizer = weakref.finalize(
+            self,
+            CoreEngineActorManager._finalize_tracked_resources,
+            self.local_engine_actors,
+            self.remote_engine_actors,
+            self.created_placement_groups,
+        )
 
         env_vars_list = get_env_vars_to_copy(
             destination=actor_class.__name__,
@@ -414,8 +477,6 @@ class CoreEngineActorManager:
         self.log_stats = log_stats
         local_engine_count = vllm_config.parallel_config.data_parallel_size_local
         world_size = vllm_config.parallel_config.world_size
-        self.manager_stopped = threading.Event()
-        self.failed_proc_name: str | None = None
 
         if ray.is_initialized():
             logger.info("Ray is already initialized. Skipping Ray initialization.")
@@ -446,18 +507,56 @@ class CoreEngineActorManager:
             )
             logger.info("Using provided placement groups")
             # TODO(rui): validate passed-in placement groups
-            self.created_placement_groups = []
         else:
-            placement_groups, local_dp_ranks = (
-                CoreEngineActorManager.create_dp_placement_groups(vllm_config)
-            )
-            self.created_placement_groups = placement_groups
-        assert len(placement_groups) == dp_size, (
-            "Number of placement groups must match data parallel size"
-        )
+            def register_placement_group(
+                pg: "PlacementGroup", _local_client: bool
+            ) -> None:
+                self.created_placement_groups.append(pg)
 
-        self.placement_group_is_local = []
-        refs = []
+            try:
+                placement_groups, local_dp_ranks = (
+                    CoreEngineActorManager.create_dp_placement_groups(
+                        vllm_config, register_placement_group
+                    )
+                )
+            except BaseException:
+                self._cleanup_failed_initialization()
+                raise
+        try:
+            assert local_dp_ranks is not None
+            assert len(placement_groups) == dp_size, (
+                "Number of placement groups must match data parallel size"
+            )
+            self._start_initial_actors(
+                vllm_config,
+                actor_class,
+                runtime_env,
+                placement_groups,
+                local_dp_ranks,
+                local_engine_count,
+                world_size,
+            )
+        except BaseException:
+            self._cleanup_failed_initialization()
+            raise
+
+    def _start_initial_actors(
+        self,
+        vllm_config: VllmConfig,
+        actor_class,
+        runtime_env,
+        placement_groups: list["PlacementGroup"],
+        local_dp_ranks: list[int],
+        local_engine_count: int,
+        world_size: int,
+    ) -> None:
+        import copy
+
+        import ray
+        from ray.runtime_env import RuntimeEnv
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        dp_size = vllm_config.parallel_config.data_parallel_size
         for index, local_index, pg in zip(
             range(dp_size), local_dp_ranks, placement_groups
         ):
@@ -471,14 +570,17 @@ class CoreEngineActorManager:
             # setting device env vars in Ray actor's initialization method
             # will not affect device selection. See:
             # https://github.com/ray-project/ray/blob/master/python/ray/_private/accelerators/intel_gpu.py#L56 # noqa: E501
+            actor_runtime_env = runtime_env
             if current_platform.is_xpu():
                 device_evar = current_platform.device_control_env_var
                 physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
                     device_evar, local_index, world_size
                 )
                 actor_env_vars = self.env_vars_dict.copy()
-                actor_env_vars[device_evar] = ",".join(str(d) for d in physical_gpu_ids)
-                runtime_env = RuntimeEnv(env_vars=actor_env_vars)
+                actor_env_vars[device_evar] = ",".join(
+                    str(device_id) for device_id in physical_gpu_ids
+                )
+                actor_runtime_env = RuntimeEnv(env_vars=actor_env_vars)
 
             actor = (
                 ray.remote(actor_class)
@@ -487,14 +589,14 @@ class CoreEngineActorManager:
                         placement_group=pg,
                         placement_group_bundle_index=world_size,
                     ),
-                    runtime_env=runtime_env,
+                    runtime_env=actor_runtime_env,
                 )
                 .remote(
                     vllm_config=dp_vllm_config,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
+                    executor_class=self.executor_class,
+                    log_stats=self.log_stats,
                     local_client=local_client,
-                    addresses=addresses,
+                    addresses=self.addresses,
                     dp_rank=index,
                     local_dp_rank=local_index,
                 )
@@ -504,19 +606,47 @@ class CoreEngineActorManager:
             else:
                 self.remote_engine_actors.append(actor)
             self.placement_group_is_local.append(local_client)
-            refs.append(actor.wait_for_init.remote())
 
-        ray.get(refs)
-        self.run_refs = []
-        self.actor_run_ref_dict = dict()
-        for actor in self.local_engine_actors + self.remote_engine_actors:
+        actors = self.local_engine_actors + self.remote_engine_actors
+        self._wait_for_elastic_ep_actor_init(
+            [actor.wait_for_init.remote() for actor in actors]
+        )
+        for actor in actors:
             ref = actor.run.remote()
             self.run_refs.append(ref)
             self.actor_run_ref_dict[actor] = ref
 
+    def _cleanup_failed_initialization(self) -> None:
+        try:
+            self.shutdown()
+        except BaseException:
+            logger.exception(
+                "Ray EngineCore cleanup failed during startup; the finalizer "
+                "remains armed for retry"
+            )
+
+    @staticmethod
+    def _finalize_tracked_resources(
+        local_actors: list,
+        remote_actors: list,
+        placement_groups: list,
+    ) -> None:
+        """Best-effort fallback when construction or explicit teardown fails."""
+        try:
+            import ray
+        except Exception:
+            return
+        for actor in tuple(local_actors + remote_actors):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+        for pg in reversed(tuple(placement_groups)):
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
+
     @staticmethod
     def create_dp_placement_groups(
         vllm_config: VllmConfig,
+        on_created: Callable[["PlacementGroup", bool], None] | None = None,
     ) -> tuple[list["PlacementGroup"], list[int]]:
         """
         Create placement groups for data parallel.
@@ -707,6 +837,10 @@ class CoreEngineActorManager:
                     bundles=bundles,
                 )
                 placement_groups.append(pg)
+                if on_created is not None:
+                    # The manager owns the PG before any later allocation or
+                    # actor operation can fail.
+                    on_created(pg, node_ip == dp_master_ip)
                 local_dp_ranks.append(i)
                 if len(placement_groups) == dp_size:
                     break
@@ -733,7 +867,9 @@ class CoreEngineActorManager:
 
     @staticmethod
     def add_dp_placement_groups(
-        old_vllm_config: VllmConfig, new_data_parallel_size: int
+        old_vllm_config: VllmConfig,
+        new_data_parallel_size: int,
+        on_created: Callable[["PlacementGroup", bool], None] | None = None,
     ) -> tuple[list["PlacementGroup"], list[int]]:
         """
         Add placement groups for new data parallel size.
@@ -811,6 +947,11 @@ class CoreEngineActorManager:
                     bundles=bundles,
                 )
                 placement_groups.append(pg)
+                if on_created is not None:
+                    # Register ownership immediately. Later placement-group or
+                    # actor creation can fail before this method returns, and
+                    # shutdown must still be able to find every created PG.
+                    on_created(pg, node_ip == dp_master_ip)
 
                 # Local rank starts from the number of engines already used
                 # on this node
@@ -818,13 +959,174 @@ class CoreEngineActorManager:
                 local_dp_ranks.append(local_rank)
                 num_pg_created += 1
 
+        if len(placement_groups) != num_pg_to_create:
+            raise ValueError(
+                f"Not enough resources to allocate {num_pg_to_create} new "
+                "elastic-EP placement groups, only created "
+                f"{len(placement_groups)} placement groups"
+            )
+        if len(local_dp_ranks) != num_pg_to_create:
+            raise RuntimeError(
+                "Elastic-EP placement-group allocation returned an "
+                "incomplete local-rank mapping"
+            )
         return placement_groups, local_dp_ranks
+
+    def reserve_scale_up_elastic_ep(
+        self,
+        cur_vllm_config: VllmConfig,
+        new_data_parallel_size: int,
+    ) -> ElasticEPScaleUpReservation:
+        """Reserve the complete Ray topology before old ranks reconfigure."""
+        with self._actor_mutation_lock:
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
+            return self._reserve_scale_up_elastic_ep_locked(
+                cur_vllm_config, new_data_parallel_size
+            )
+
+    def _reserve_scale_up_elastic_ep_locked(
+        self,
+        cur_vllm_config: VllmConfig,
+        new_data_parallel_size: int,
+    ) -> ElasticEPScaleUpReservation:
+        cur_data_parallel_size = len(self.local_engine_actors) + len(
+            self.remote_engine_actors
+        )
+        configured_dp_size = (
+            cur_vllm_config.parallel_config.data_parallel_size
+        )
+        if configured_dp_size != cur_data_parallel_size:
+            raise RuntimeError(
+                "Elastic-EP actor topology does not match the configured "
+                "data-parallel size"
+            )
+        if new_data_parallel_size <= cur_data_parallel_size:
+            raise ValueError(
+                f"New data parallel size {new_data_parallel_size} must be "
+                f"greater than current data parallel size "
+                f"{cur_data_parallel_size} for scale up"
+            )
+
+        new_placement_groups: list["PlacementGroup"] = []
+
+        def register_placement_group(
+            pg: "PlacementGroup", local_client: bool
+        ) -> None:
+            # Publish ownership immediately so both rollback and shutdown can
+            # find a placement group if allocation fails partway through.
+            self.created_placement_groups.append(pg)
+            self.placement_group_is_local.append(local_client)
+            new_placement_groups.append(pg)
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
+
+        try:
+            placement_groups, local_dp_ranks = self.add_dp_placement_groups(
+                cur_vllm_config,
+                new_data_parallel_size,
+                register_placement_group,
+            )
+            expected = new_data_parallel_size - cur_data_parallel_size
+            if (
+                len(placement_groups) != expected
+                or len(local_dp_ranks) != expected
+                or len(new_placement_groups) != expected
+            ):
+                raise RuntimeError(
+                    "Elastic-EP scale-up could not reserve the complete "
+                    f"target topology: expected {expected} new ranks, got "
+                    f"{len(placement_groups)} placement groups and "
+                    f"{len(local_dp_ranks)} local-rank mappings"
+                )
+            if any(
+                created is not returned
+                for created, returned in zip(
+                    new_placement_groups, placement_groups, strict=True
+                )
+            ):
+                raise RuntimeError(
+                    "Elastic-EP placement-group ownership does not match "
+                    "the reserved topology"
+                )
+            self._wait_for_elastic_ep_placement_groups(placement_groups)
+            return ElasticEPScaleUpReservation(
+                owner_id=id(self),
+                old_data_parallel_size=cur_data_parallel_size,
+                new_data_parallel_size=new_data_parallel_size,
+                placement_groups=placement_groups,
+                local_dp_ranks=local_dp_ranks,
+            )
+        except BaseException as error:
+            # Preserve the allocation failure while leaving any resource that
+            # resisted cleanup tracked for shutdown retry.
+            cleaned = self._rollback_elastic_ep_scale_up(
+                [], new_placement_groups
+            )
+            if not cleaned:
+                raise ElasticEPScaleUpReservationError(
+                    "Elastic-EP scale-up reservation failed and not every "
+                    "placement group could be released; shutdown is required"
+                ) from error
+            raise
+
+    def release_scale_up_elastic_ep_reservation(
+        self, reservation: ElasticEPScaleUpReservation
+    ) -> None:
+        """Release an unconsumed scale-up reservation after prepare fails."""
+        with self._actor_mutation_lock:
+            if reservation.owner_id != id(self):
+                raise RuntimeError(
+                    "Elastic-EP scale-up reservation belongs to another "
+                    "actor manager"
+                )
+            if reservation.state != "reserved":
+                return
+            reservation.state = "released"
+            cleaned = self._rollback_elastic_ep_scale_up(
+                [], list(reservation.placement_groups)
+            )
+            if not cleaned:
+                raise RuntimeError(
+                    "Failed to release every reserved elastic-EP placement "
+                    "group; shutdown is required before retrying"
+                )
 
     def scale_up_elastic_ep(
         self,
         cur_vllm_config: VllmConfig,
         new_data_parallel_size: int,
         num_redundant_experts: int,
+        reservation: ElasticEPScaleUpReservation | None = None,
+    ) -> None:
+        with self._actor_mutation_lock:
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
+            if reservation is None:
+                reservation = self._reserve_scale_up_elastic_ep_locked(
+                    cur_vllm_config, new_data_parallel_size
+                )
+            try:
+                self._scale_up_elastic_ep_locked(
+                    cur_vllm_config,
+                    new_data_parallel_size,
+                    num_redundant_experts,
+                    reservation,
+                )
+            except BaseException:
+                if reservation.state == "reserved":
+                    reservation.state = "released"
+                    self._rollback_elastic_ep_scale_up(
+                        [], list(reservation.placement_groups)
+                    )
+                raise
+
+    def _scale_up_elastic_ep_locked(
+        self,
+        cur_vllm_config: VllmConfig,
+        new_data_parallel_size: int,
+        num_redundant_experts: int,
+        reservation: ElasticEPScaleUpReservation,
     ) -> None:
         import copy
 
@@ -850,81 +1152,239 @@ class CoreEngineActorManager:
             "for scale up"
         )
 
-        placement_groups, local_dp_ranks = self.add_dp_placement_groups(
-            cur_vllm_config, new_data_parallel_size
-        )
-
         world_size = cur_vllm_config.parallel_config.world_size
         dp_master_ip = cur_vllm_config.parallel_config.data_parallel_master_ip
         new_local_engines = 0
+        new_actors: list = []
+        expected = new_data_parallel_size - cur_data_parallel_size
+        if reservation.owner_id != id(self):
+            raise RuntimeError(
+                "Elastic-EP scale-up reservation belongs to another actor "
+                "manager"
+            )
+        if reservation.state != "reserved":
+            raise RuntimeError(
+                "Elastic-EP scale-up reservation has already been consumed "
+                "or released"
+            )
+        if (
+            reservation.old_data_parallel_size != cur_data_parallel_size
+            or reservation.new_data_parallel_size != new_data_parallel_size
+            or len(reservation.placement_groups) != expected
+            or len(reservation.local_dp_ranks) != expected
+        ):
+            raise RuntimeError(
+                "Elastic-EP scale-up reservation does not match the requested "
+                "topology"
+            )
+        if any(
+            not any(tracked is pg for tracked in self.created_placement_groups)
+            for pg in reservation.placement_groups
+        ):
+            raise RuntimeError(
+                "Elastic-EP scale-up reservation is no longer owned by the "
+                "actor manager"
+            )
+
+        placement_groups = reservation.placement_groups
+        local_dp_ranks = reservation.local_dp_ranks
+        reservation.state = "consumed"
 
         runtime_env = RuntimeEnv(
             env_vars=self.env_vars_dict | {"VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": "1"}
         )
-        for i, (pg, local_rank) in enumerate(zip(placement_groups, local_dp_ranks)):
-            rank = cur_data_parallel_size + i
-            dp_vllm_config = copy.deepcopy(cur_vllm_config)
-            if new_data_parallel_size > 1:
-                _apply_dp_identity_suffix(dp_vllm_config, rank)
-            dp_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-            dp_vllm_config.parallel_config.eplb_config.num_redundant_experts = (
-                num_redundant_experts
-            )
-            dp_vllm_config.parallel_config.placement_group = pg
+        try:
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
 
-            # Check if this placement group is on the head node
-            local_client = any(
-                bundle.get("node:" + dp_master_ip, 0) > 0 for bundle in pg.bundle_specs
-            )
+            for i, (pg, local_rank) in enumerate(
+                zip(placement_groups, local_dp_ranks)
+            ):
+                if self.manager_stopped.is_set():
+                    raise RuntimeError("EngineCore actor manager is shutting down")
+                rank = cur_data_parallel_size + i
+                dp_vllm_config = copy.deepcopy(cur_vllm_config)
+                if new_data_parallel_size > 1:
+                    _apply_dp_identity_suffix(dp_vllm_config, rank)
+                dp_vllm_config.parallel_config.data_parallel_size = (
+                    new_data_parallel_size
+                )
+                dp_vllm_config.parallel_config.eplb_config.num_redundant_experts = (
+                    num_redundant_experts
+                )
+                dp_vllm_config.parallel_config.placement_group = pg
 
-            if local_client:
-                new_local_engines += 1
-                # Update data_parallel_size_local
-                dp_vllm_config.parallel_config.data_parallel_size_local = (
-                    cur_vllm_config.parallel_config.data_parallel_size_local
-                    + new_local_engines
+                # Check if this placement group is on the head node.
+                local_client = any(
+                    bundle.get("node:" + dp_master_ip, 0) > 0
+                    for bundle in pg.bundle_specs
                 )
 
-            actor = (
-                ray.remote(actor_class)
-                .options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=world_size,
-                    ),
-                    runtime_env=runtime_env,
-                )
-                .remote(
-                    vllm_config=dp_vllm_config,
-                    executor_class=self.executor_class,
-                    log_stats=self.log_stats,
-                    local_client=local_client,
-                    addresses=self.addresses,
-                    dp_rank=rank,
-                    local_dp_rank=local_rank,
-                )
-            )
+                if local_client:
+                    new_local_engines += 1
+                    # Update data_parallel_size_local.
+                    dp_vllm_config.parallel_config.data_parallel_size_local = (
+                        cur_vllm_config.parallel_config.data_parallel_size_local
+                        + new_local_engines
+                    )
 
-            if local_client:
-                self.local_engine_actors.append(actor)
+                actor = (
+                    ray.remote(actor_class)
+                    .options(
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=world_size,
+                        ),
+                        runtime_env=runtime_env,
+                    )
+                    .remote(
+                        vllm_config=dp_vllm_config,
+                        executor_class=self.executor_class,
+                        log_stats=self.log_stats,
+                        local_client=local_client,
+                        addresses=self.addresses,
+                        dp_rank=rank,
+                        local_dp_rank=local_rank,
+                    )
+                )
+
+                if local_client:
+                    self.local_engine_actors.append(actor)
+                else:
+                    self.remote_engine_actors.append(actor)
+                new_actors.append(actor)
+
+            self._wait_for_elastic_ep_actor_init(
+                [actor.wait_for_init.remote() for actor in new_actors]
+            )
+            for actor in new_actors:
+                if self.manager_stopped.is_set():
+                    raise RuntimeError("EngineCore actor manager is shutting down")
+                ref = actor.run.remote()
+                self.run_refs.append(ref)
+                self.actor_run_ref_dict[actor] = ref
+        except BaseException:
+            # Roll back what this transaction created while the mutation lock
+            # is still held. Failed cleanup remains tracked for shutdown retry.
+            self._rollback_elastic_ep_scale_up(
+                new_actors, list(placement_groups)
+            )
+            reservation.state = "released"
+            raise
+
+    def _rollback_elastic_ep_scale_up(
+        self, actors: list, placement_groups: list
+    ) -> bool:
+        import ray
+
+        cleaned = True
+        for actor in reversed(actors):
+            try:
+                ray.kill(actor)
+            except BaseException:
+                cleaned = False
+                logger.exception(
+                    "Failed to kill a partially-created elastic-EP actor"
+                )
             else:
-                self.remote_engine_actors.append(actor)
-            self.created_placement_groups.append(pg)
-            self.placement_group_is_local.append(local_client)
+                self._forget_actor(actor)
 
-        actors = (
-            self.local_engine_actors[-new_local_engines:]
-            if new_local_engines > 0
-            else []
-        ) + self.remote_engine_actors[-(len(placement_groups) - new_local_engines) :]
+        for pg in reversed(placement_groups):
+            try:
+                ray.util.remove_placement_group(pg)
+            except BaseException:
+                cleaned = False
+                logger.exception(
+                    "Failed to remove a partially-created elastic-EP "
+                    "placement group"
+                )
+            else:
+                self._forget_created_placement_group(pg)
+        return cleaned
 
-        ray.get([actor.wait_for_init.remote() for actor in actors])
-        for actor in actors:
-            ref = actor.run.remote()
-            self.run_refs.append(ref)
-            self.actor_run_ref_dict[actor] = ref
+    def _forget_actor(self, actor) -> None:
+        ref = self.actor_run_ref_dict.pop(actor, None)
+        if ref is not None:
+            with contextlib.suppress(ValueError):
+                self.run_refs.remove(ref)
+        for actors in (self.local_engine_actors, self.remote_engine_actors):
+            for index, tracked_actor in enumerate(actors):
+                if tracked_actor is actor:
+                    actors.pop(index)
+                    return
+
+    def _forget_created_placement_group(self, pg) -> None:
+        base_count = len(self.placement_group_is_local) - len(
+            self.created_placement_groups
+        )
+        for index, tracked_pg in enumerate(self.created_placement_groups):
+            if tracked_pg is pg:
+                self.created_placement_groups.pop(index)
+                flag_index = base_count + index
+                if 0 <= flag_index < len(self.placement_group_is_local):
+                    self.placement_group_is_local.pop(flag_index)
+                return
+
+    def _wait_for_elastic_ep_actor_init(self, refs: list) -> None:
+        """Wait in short slices so shutdown can interrupt Ray actor startup."""
+        import ray
+
+        pending = refs
+        deadline = time.monotonic() + envs.VLLM_ENGINE_READY_TIMEOUT_S
+        while pending:
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Timed out waiting for Ray EngineCore actors to "
+                    f"start after {envs.VLLM_ENGINE_READY_TIMEOUT_S}s"
+                )
+            ready, pending = ray.wait(
+                pending,
+                num_returns=len(pending),
+                timeout=min(1.0, remaining),
+            )
+            if ready:
+                # Surface actor construction failures as soon as they arrive.
+                ray.get(ready)
+
+    def _wait_for_elastic_ep_placement_groups(
+        self, placement_groups: list["PlacementGroup"]
+    ) -> None:
+        """Wait until every reserved placement group is actually scheduled."""
+        import ray
+
+        pending = [placement_group.ready() for placement_group in placement_groups]
+        deadline = time.monotonic() + envs.VLLM_ENGINE_READY_TIMEOUT_S
+        while pending:
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Timed out waiting for elastic-EP placement groups to "
+                    f"become ready after {envs.VLLM_ENGINE_READY_TIMEOUT_S}s"
+                )
+            ready, pending = ray.wait(
+                pending,
+                num_returns=len(pending),
+                timeout=min(1.0, remaining),
+            )
+            if ready:
+                ray.get(ready)
 
     def scale_down_elastic_ep(
+        self, cur_data_parallel_size: int, new_data_parallel_size: int
+    ) -> None:
+        with self._actor_mutation_lock:
+            if self.manager_stopped.is_set():
+                raise RuntimeError("EngineCore actor manager is shutting down")
+            self._scale_down_elastic_ep_locked(
+                cur_data_parallel_size, new_data_parallel_size
+            )
+
+    def _scale_down_elastic_ep_locked(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
     ) -> None:
         import ray
@@ -935,32 +1395,38 @@ class CoreEngineActorManager:
             "for scale down"
         )
         for _ in range(cur_data_parallel_size - new_data_parallel_size):
-            pg = self.created_placement_groups.pop()
-            is_local = self.placement_group_is_local.pop()
+            pg = self.created_placement_groups[-1]
+            is_local = self.placement_group_is_local[-1]
+            # Keep ownership bookkeeping intact if Ray reports a cleanup
+            # failure so fail-stop shutdown can retry the same resource.
+            ray.util.remove_placement_group(pg)
+            self.created_placement_groups.pop()
+            self.placement_group_is_local.pop()
             if is_local:
                 self.local_engine_actors.pop()
             else:
                 self.remote_engine_actors.pop()
-            ray.util.remove_placement_group(pg)
 
     def remove_run_refs_for_scale_down(self, removed_dp_size: int) -> None:
         if removed_dp_size <= 0:
             return
-        flags = self.placement_group_is_local[-removed_dp_size:]
-        li = len(self.local_engine_actors) - 1
-        ri = len(self.remote_engine_actors) - 1
-        for is_local in reversed(flags):
-            if is_local:
-                actor = self.local_engine_actors[li]
-                li -= 1
-            else:
-                actor = self.remote_engine_actors[ri]
-                ri -= 1
-            ref = self.actor_run_ref_dict.pop(actor)
-            self.run_refs.remove(ref)
+        with self._actor_mutation_lock:
+            flags = self.placement_group_is_local[-removed_dp_size:]
+            li = len(self.local_engine_actors) - 1
+            ri = len(self.remote_engine_actors) - 1
+            for is_local in reversed(flags):
+                if is_local:
+                    actor = self.local_engine_actors[li]
+                    li -= 1
+                else:
+                    actor = self.remote_engine_actors[ri]
+                    ri -= 1
+                ref = self.actor_run_ref_dict.pop(actor)
+                self.run_refs.remove(ref)
 
     def get_run_refs(self):
-        return self.run_refs
+        with self._actor_mutation_lock:
+            return list(self.run_refs)
 
     def monitor_engine_liveness(self) -> None:
         import ray
@@ -996,10 +1462,40 @@ class CoreEngineActorManager:
         import ray
 
         self.manager_stopped.set()
-        for actor in self.local_engine_actors + self.remote_engine_actors:
-            ray.kill(actor)
-        for pg in self.created_placement_groups:
-            ray.util.remove_placement_group(pg)
+        primary_error: BaseException | None = None
+        with self._actor_mutation_lock:
+            for actor in tuple(
+                self.local_engine_actors + self.remote_engine_actors
+            ):
+                try:
+                    ray.kill(actor)
+                except BaseException as error:
+                    if primary_error is None:
+                        primary_error = error
+                    else:
+                        logger.exception(
+                            "Additional EngineCore actor shutdown failure"
+                        )
+                else:
+                    self._forget_actor(actor)
+
+            for pg in reversed(tuple(self.created_placement_groups)):
+                try:
+                    ray.util.remove_placement_group(pg)
+                except BaseException as error:
+                    if primary_error is None:
+                        primary_error = error
+                    else:
+                        logger.exception(
+                            "Additional placement-group shutdown failure"
+                        )
+                else:
+                    self._forget_created_placement_group(pg)
+
+        if primary_error is not None:
+            raise primary_error
+        if self._finalizer.alive:
+            self._finalizer.detach()
 
 
 def get_engine_zmq_addresses(
@@ -1109,17 +1605,42 @@ def launch_core_engines(
     else:
         coordinator = None
 
+    def cleanup_failed_launch(
+        engine_manager: CoreEngineProcManager | CoreEngineActorManager | None,
+    ) -> None:
+        """Synchronously roll back resources when launch cannot transfer ownership."""
+        for resource_name, resource in (
+            ("EngineCore manager", engine_manager),
+            ("DP coordinator", coordinator),
+        ):
+            if resource is None:
+                continue
+            try:
+                resource.shutdown()
+            except BaseException:
+                # Preserve the launch/body exception; each resource keeps its
+                # own finalizer armed when explicit cleanup cannot finish.
+                logger.exception(
+                    "Failed to shut down %s after core engine launch failure",
+                    resource_name,
+                )
+
     if parallel_config.data_parallel_backend == "ray":
         logger.info("Starting ray-based data parallel backend")
 
-        engine_actor_manager = CoreEngineActorManager(
-            vllm_config=vllm_config,
-            addresses=addresses,
-            executor_class=executor_class,
-            log_stats=log_stats,
-        )
+        engine_actor_manager = None
+        try:
+            engine_actor_manager = CoreEngineActorManager(
+                vllm_config=vllm_config,
+                addresses=addresses,
+                executor_class=executor_class,
+                log_stats=log_stats,
+            )
 
-        yield engine_actor_manager, coordinator, addresses, tensor_queue
+            yield engine_actor_manager, coordinator, addresses, tensor_queue
+        except BaseException:
+            cleanup_failed_launch(engine_actor_manager)
+            raise
         return
 
     if offline_mode:
@@ -1168,39 +1689,44 @@ def launch_core_engines(
         local_handshake_address = handshake_address
         client_handshake_address = None
 
-    with zmq_socket_ctx(
-        local_handshake_address, zmq.ROUTER, bind=True
-    ) as handshake_socket:
-        # Start local engines.
-        if local_engine_count:
-            local_engine_manager = CoreEngineProcManager(
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=log_stats,
-                handshake_address=handshake_address,
-                client_handshake_address=client_handshake_address,
-                local_client=True,
-                local_engine_count=local_engine_count,
-                start_index=dp_rank,
-                local_start_index=local_start_index or 0,
-                tensor_queue=tensor_queue,
+    local_engine_manager = None
+    try:
+        with zmq_socket_ctx(
+            local_handshake_address, zmq.ROUTER, bind=True
+        ) as handshake_socket:
+            # Start local engines.
+            if local_engine_count:
+                local_engine_manager = CoreEngineProcManager(
+                    vllm_config=vllm_config,
+                    executor_class=executor_class,
+                    log_stats=log_stats,
+                    handshake_address=handshake_address,
+                    client_handshake_address=client_handshake_address,
+                    local_client=True,
+                    local_engine_count=local_engine_count,
+                    start_index=dp_rank,
+                    local_start_index=local_start_index or 0,
+                    tensor_queue=tensor_queue,
+                )
+            else:
+                local_engine_manager = None
+
+            yield local_engine_manager, coordinator, addresses, tensor_queue
+
+            # Now wait for engines to start.
+            wait_for_engine_startup(
+                handshake_socket,
+                addresses,
+                engines_to_handshake,
+                parallel_config,
+                dp_size > 1 and vllm_config.model_config.is_moe,
+                vllm_config.cache_config,
+                local_engine_manager,
+                coordinator.proc if coordinator else None,
             )
-        else:
-            local_engine_manager = None
-
-        yield local_engine_manager, coordinator, addresses, tensor_queue
-
-        # Now wait for engines to start.
-        wait_for_engine_startup(
-            handshake_socket,
-            addresses,
-            engines_to_handshake,
-            parallel_config,
-            dp_size > 1 and vllm_config.model_config.is_moe,
-            vllm_config.cache_config,
-            local_engine_manager,
-            coordinator.proc if coordinator else None,
-        )
+    except BaseException:
+        cleanup_failed_launch(local_engine_manager)
+        raise
 
 
 def wait_for_engine_startup(

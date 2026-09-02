@@ -138,6 +138,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_worker.build_connector_worker_meta()
         return None
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
@@ -167,6 +171,70 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def has_pending_push_work(self) -> bool:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.has_pending_push_work()
+
+    def get_prefix_pin_alignment(self) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_prefix_pin_alignment()
+
+    def pin_prefix(self, pin_id: str, request: Request) -> list[int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.pin_prefix(pin_id, request)
+
+    def pin_request_kv(
+        self,
+        pin_id: str,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return bool(
+            self.connector_scheduler.pin_request_kv(
+                pin_id,
+                request,
+                num_computed_tokens,
+            )
+        )
+
+    def pin_request_kv_with_snapshot(
+        self,
+        pin_id: str,
+        request: Request,
+        num_computed_tokens: int,
+        blocks: KVCacheBlocks,
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return bool(
+            self.connector_scheduler.pin_request_kv(
+                pin_id,
+                request,
+                num_computed_tokens,
+                blocks,
+            )
+        )
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.is_prefix_pin_ready(pin_id)
+
+    def get_prefix_pin_error(self, pin_id: str) -> str | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_prefix_pin_error(pin_id)
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_prefix_pin_block_ids(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.unpin_prefix(pin_id)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.has_pinned_prefix(pin_id)
+
+    def has_pinned_prefixes(self) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.has_pinned_prefixes()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
@@ -198,8 +266,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
     def reset_cache(self) -> bool | None:
         assert self.connector_scheduler is not None
-        self.connector_scheduler.reset_cache()
-        return True
+        return self.connector_scheduler.reset_cache()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_scheduler is not None:

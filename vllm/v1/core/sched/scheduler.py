@@ -4,7 +4,8 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -38,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.inflight_prefix import InFlightPrefixTracker
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -52,7 +54,13 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    PrefixPinResult,
+    PrefixPinTier,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -64,6 +72,16 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class _PrefixPinState:
+    pin_id: str
+    request_id: str
+    tier: PrefixPinTier
+    num_tokens: int
+    future: Future[PrefixPinResult]
+    gpu_blocks_pinned: bool = False
 
 
 class Scheduler(SchedulerInterface):
@@ -120,6 +138,13 @@ class Scheduler(SchedulerInterface):
         # Diffusion models may not sample any tokens for a denoising step.
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
+        )
+        # Any speculative runner may execute a drafter (or a matching dummy
+        # drafter pass on otherwise-idle DP ranks) as part of sampling. A
+        # prefix-only batch is local to its owning rank, so bypassing sampling
+        # there could desynchronize drafter collectives from peer ranks.
+        self._prefix_pin_sampler_bypass_supported = (
+            self._supports_prefix_sampler_bypass(vllm_config)
         )
 
         # Create KVConnector for the Scheduler. Note that each Worker
@@ -359,6 +384,37 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # Internal prefix-pin requests are ordinary Request objects whose
+        # control metadata remains scheduler-local. This avoids extending the
+        # public EngineCore request protocol with internal lifecycle fields.
+        self._prefix_pins: dict[str, _PrefixPinState] = {}
+        self._request_to_prefix_pin: dict[str, str] = {}
+        self._completed_prefix_pin_tiers: dict[str, PrefixPinTier] = {}
+        self._completed_prefix_pin_request_ids: dict[str, str] = {}
+
+        # Coordinate cache visibility through the physical scheduler-block
+        # view even when hashing uses a finer prefix-match unit.
+        self._inflight_prefixes = InFlightPrefixTracker(
+            self.hash_block_size, self.block_size
+        )
+        self._prefix_reservations: dict[str, list[KVCacheBlock]] = {}
+
+        # Per-request pause state. GPU-only pauses leave the request's block
+        # table in place. CPU-backed pauses use ordinary free/lookup paths and
+        # never transfer a live Mamba table through hard-pin pop/restore APIs.
+        self._paused_requests: dict[str, Request] = {}
+        self._pause_resume_status: dict[str, RequestStatus] = {}
+        self._pending_pause_req_ids: set[str] = set()
+        self._pending_resume_req_ids: set[str] = set()
+        self._pause_cpu_pin_ids: dict[str, str] = {}
+        self._pause_cpu_waiting: set[str] = set()
+        self._pause_cpu_backed_tokens: dict[str, int] = {}
+        self._pause_original_computed_tokens: dict[str, int] = {}
+        self._resuming_cpu_pauses: set[str] = set()
+        self._pause_ack_ready_ids: set[str] = set()
+        self._pause_waiters: list[tuple[set[str], Future[None]]] = []
+        self._resume_waiters: list[tuple[set[str], Future[None]]] = []
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -436,6 +492,29 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _should_bypass_sampler_for_prefix_batch(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        prefill_only_req_ids: set[str],
+    ) -> bool:
+        return (
+            self._prefix_pin_sampler_bypass_supported
+            and not self.use_pp
+            and bool(num_scheduled_tokens)
+            and len(prefill_only_req_ids) == len(num_scheduled_tokens)
+        )
+
+    @staticmethod
+    def _supports_prefix_sampler_bypass(vllm_config: VllmConfig) -> bool:
+        return vllm_config.speculative_config is None
+
+    def _request_lookahead_tokens(
+        self, request_id: str, *, load_kv_async: bool = False
+    ) -> int:
+        if load_kv_async or request_id in self._request_to_prefix_pin:
+            return 0
+        return self.num_lookahead_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -480,10 +559,39 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # Prefix-pin prefills are isolated from user batches. Their final
+        # chunk is prefill-only, allowing both model runners to skip sampling
+        # without adding an internal-request mask to their persistent batches.
+        exclusive_pin_request_id = next(
+            (
+                request.request_id
+                for request in self.running
+                if request.request_id in self._request_to_prefix_pin
+            ),
+            None,
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                exclusive_pin_request_id is not None
+                and request.request_id != exclusive_pin_request_id
+            ):
+                req_index += 1
+                continue
+
+            if (
+                request.request_id in self._request_to_prefix_pin
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                # The final prefix prefill is still in flight. AsyncScheduler
+                # may have added an output placeholder, but internal pins never
+                # schedule a decode step while waiting for that completion.
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -578,7 +686,9 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=self._request_lookahead_tokens(
+                            request.request_id
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -681,14 +791,17 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and exclusive_pin_request_id is None
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
-                num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_running_reqs:
+                if not self._has_free_request_slot():
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -696,6 +809,15 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                pin_id = self._request_to_prefix_pin.get(request_id)
+                pin_state = self._prefix_pins.get(pin_id) if pin_id else None
+
+                # Do not mix an internal prefix prefill into an already-built
+                # user batch. Once admitted below, it ends this waiting pass.
+                if pin_state is not None and num_scheduled_tokens:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -740,13 +862,30 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                default_max_cache_hit_length = (
+                    request.num_prompt_tokens
+                    if pin_state is not None
+                    else request.num_tokens - 1
+                )
+                max_cache_hit_length = default_max_cache_hit_length
+                if (
+                    self.cache_config.enable_prefix_caching
+                    and not request.skip_reading_prefix_cache
+                ):
+                    max_cache_hit_length = (
+                        self._inflight_prefixes.limit_cache_hit_length(
+                            request_id,
+                            request.block_hashes,
+                            max_cache_hit_length,
+                        )
+                    )
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
                     hit_diverged = False
                     # Get locally-cached tokens.
-                    if self.connector is not None:
+                    if self.connector is not None and pin_state is None:
                         # A KV connector transfers the missing suffix, which needs a
                         # hybrid-aware lookup that can diverge across groups.
                         (
@@ -755,7 +894,7 @@ class Scheduler(SchedulerInterface):
                             request.shared_prefix_boundary,
                             hit_diverged,
                         ) = self.kv_cache_manager.get_computed_blocks_for_connector(
-                            request
+                            request, max_cache_hit_length
                         )
                     else:
                         (
@@ -763,10 +902,12 @@ class Scheduler(SchedulerInterface):
                             num_new_local_computed_tokens,
                             # Marconi shared-prefix junction to pin; 0 if none.
                             request.shared_prefix_boundary,
-                        ) = self.kv_cache_manager.get_computed_blocks(request)
+                        ) = self.kv_cache_manager.get_computed_blocks(
+                            request, max_cache_hit_length
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    if self.connector is not None and pin_state is None:
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
                         # sub-block tail without racing its copy-on-write.
@@ -818,7 +959,9 @@ class Scheduler(SchedulerInterface):
                                 new_computed_blocks,
                                 num_new_local_computed_tokens,
                                 request.shared_prefix_boundary,
-                            ) = self.kv_cache_manager.get_computed_blocks(request)
+                            ) = self.kv_cache_manager.get_computed_blocks(
+                                request, max_cache_hit_length
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -857,6 +1000,52 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if self.cache_config.enable_prefix_caching:
+                    waiting_for_prefix = self._inflight_prefixes.register(
+                        request_id,
+                        request.block_hashes,
+                        num_computed_tokens,
+                        request.num_prompt_tokens,
+                        default_max_cache_hit_length,
+                        wait_for_pending=not request.skip_reading_prefix_cache,
+                    )
+                    if waiting_for_prefix:
+                        request_queue.pop_request()
+                        request.status = RequestStatus.WAITING_FOR_PREFIX
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
+                # Prefix-only requests can adopt a complete cache hit without
+                # a dummy forward. CPU pins still schedule connector metadata
+                # in this empty step to copy the adopted GPU blocks.
+                if (
+                    pin_state is not None
+                    and num_new_local_computed_tokens
+                    == request.num_prompt_tokens
+                    and num_external_computed_tokens == 0
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        0,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    if new_blocks is None:
+                        break
+                    request_queue.pop_request()
+                    request.num_computed_tokens = request.num_prompt_tokens
+                    if pin_state.tier == "cpu":
+                        assert self.connector is not None
+                        self.connector.update_state_after_alloc(
+                            request,
+                            self.kv_cache_manager.get_blocks(request_id),
+                            0,
+                        )
+                    self._consume_prefix_dependency(request_id)
+                    self._complete_prefix_pin_compute(request, pin_state)
+                    continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -942,12 +1131,12 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         break
 
-                # During async KV load, no forward pass is run yet.
-                # Allocate speculative lookahead slots later to avoid
-                # mismatching local and remote block counts.
-                limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
-                effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                # Async loads allocate speculative lookahead later. Internal
+                # prefix prefills never sample, so they must not own unused
+                # lookahead blocks at their hard-pin boundary.
+                effective_lookahead_tokens = self._request_lookahead_tokens(
+                    request_id,
+                    load_kv_async=load_kv_async,
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -993,11 +1182,15 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                self._consume_prefix_dependency(request_id)
+
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
                 # needed for this request.
-                if self.connector is not None:
+                if self.connector is not None and (
+                    pin_state is None or pin_state.tier == "cpu"
+                ):
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -1012,6 +1205,11 @@ class Scheduler(SchedulerInterface):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
+
+                if not load_kv_async:
+                    self._complete_cpu_pause_restore_after_local_admission(
+                        request_id
+                    )
 
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
@@ -1096,6 +1294,9 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+                if pin_state is not None:
+                    break
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1110,7 +1311,7 @@ class Scheduler(SchedulerInterface):
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
+        assert self._num_occupied_request_slots() <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -1205,6 +1406,20 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        prefill_only_req_ids = {
+            request_id
+            for request_id, num_scheduled in num_scheduled_tokens.items()
+            if (
+                request_id in self._request_to_prefix_pin
+                and self.requests[request_id].num_computed_tokens + num_scheduled
+                >= self.requests[request_id].num_prompt_tokens
+            )
+        }
+        skip_sampler = self._should_bypass_sampler_for_prefix_batch(
+            num_scheduled_tokens,
+            prefill_only_req_ids,
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1226,6 +1441,8 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            prefill_only_req_ids=prefill_only_req_ids or None,
+            skip_sampler=skip_sampler,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1245,7 +1462,7 @@ class Scheduler(SchedulerInterface):
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
+        if total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
@@ -1287,6 +1504,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        self._remove_inflight_prefix_request(request.request_id)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1329,9 +1547,9 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
-            if self.defer_block_free:
-                # Record the in-flight step, to fence deferred block freeing.
-                request.last_sched_seq = self.sched_step_seq
+            # Record every non-empty in-flight step. Per-request pause uses the
+            # same fence even when deferred block freeing is not configured.
+            request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -1683,9 +1901,10 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+        if scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
-            self._drain_deferred_frees()
+            if self.defer_block_free:
+                self._drain_deferred_frees()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1752,6 +1971,21 @@ class Scheduler(SchedulerInterface):
                 # cache transfer in KV connector), the aborted request will not
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
+                continue
+
+            if self._inflight_prefixes.update_from_output(
+                req_id, num_tokens_scheduled
+            ):
+                self._retain_prefix_blocks(req_id)
+
+            pin_id = self._request_to_prefix_pin.get(req_id)
+            pin_state = self._prefix_pins.get(pin_id) if pin_id else None
+            if (
+                pin_state is not None
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                self._complete_prefix_pin_compute(request, pin_state)
+                stopped_running_reqs.add(request)
                 continue
 
             # Drop-mode stale output (same-step resume) is discarded entirely.
@@ -1975,6 +2209,11 @@ class Scheduler(SchedulerInterface):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
+        self._finalize_pending_pauses()
+        self._poll_prefix_pin_completions()
+        self._poll_pause_cpu_backing()
+        self._flush_request_operation_waiters()
+
         # Worker-side KV connector stats from the model runner output.
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
@@ -2052,8 +2291,61 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_PREFIX,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
+
+    def _retain_prefix_blocks(self, producer_id: str) -> None:
+        if not self._inflight_prefixes.producer_needs_reservation(producer_id):
+            return
+        retained = self._prefix_reservations.setdefault(producer_id, [])
+        retained_ids = {block.block_id for block in retained}
+        completed_tokens = self._inflight_prefixes.completed_tokens(producer_id)
+        if completed_tokens is None:
+            return
+        completed_tokens -= completed_tokens % self.block_size
+        if completed_tokens <= 0 or producer_id not in self.requests:
+            return
+        retained.extend(
+            self.kv_cache_manager.retain_request_blocks(
+                producer_id, completed_tokens, retained_ids
+            )
+        )
+
+    def _release_prefix_reservation(self, producer_id: str) -> None:
+        retained = self._prefix_reservations.pop(producer_id, None)
+        if retained:
+            self.kv_cache_manager.release_retained_blocks(retained)
+
+    def _maybe_release_prefix_reservation(self, producer_id: str) -> None:
+        if not self._inflight_prefixes.producer_needs_reservation(producer_id):
+            self._release_prefix_reservation(producer_id)
+
+    def _consume_prefix_dependency(self, request_id: str) -> None:
+        producer_id = self._inflight_prefixes.consume_ready_dependency(request_id)
+        if producer_id is not None:
+            self._maybe_release_prefix_reservation(producer_id)
+
+    def _remove_inflight_prefix_request(self, request_id: str) -> None:
+        # Do not evict "uncomputed" block IDs here. A shared partial entry can
+        # be a valid durable cache entry for another request even when it sits
+        # beyond this request's completed-token boundary.
+        maybe_releasable = self._inflight_prefixes.remove_request(request_id)
+        maybe_releasable.add(request_id)
+        for producer_id in maybe_releasable:
+            self._maybe_release_prefix_reservation(producer_id)
+
+    def _clear_inflight_prefixes(self) -> None:
+        for producer_id in tuple(self._prefix_reservations):
+            self._release_prefix_reservation(producer_id)
+        self._inflight_prefixes.clear()
+        for request in self.requests.values():
+            if request.status == RequestStatus.WAITING_FOR_PREFIX:
+                request.status = (
+                    RequestStatus.PREEMPTED
+                    if request.num_preemptions
+                    else RequestStatus.WAITING
+                )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
@@ -2214,7 +2506,10 @@ class Scheduler(SchedulerInterface):
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
-            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            if (
+                existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+                or existing.request_id in self._pending_pause_req_ids
+            ):
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
                 existing.streaming_queue.append(update)
@@ -2227,12 +2522,645 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            self._pause_ack_ready_ids.discard(request.request_id)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def pin_prefix(
+        self,
+        pin_id: str,
+        request: Request,
+        tier: PrefixPinTier = "gpu",
+    ) -> Future[PrefixPinResult]:
+        """Compute and hard-pin a token prefix at the requested tier."""
+        if not self.cache_config.enable_prefix_caching:
+            raise RuntimeError("pin_prefix requires prefix caching to be enabled")
+        if tier not in ("gpu", "cpu"):
+            raise ValueError(f"unsupported prefix pin tier: {tier!r}")
+        if pin_id in self._prefix_pins or pin_id in self._completed_prefix_pin_tiers:
+            raise ValueError(f"prefix pin already exists or is pending: {pin_id!r}")
+        if self.kv_cache_manager.has_pinned_prefix(pin_id) or (
+            self.connector is not None and self.connector.has_pinned_prefix(pin_id)
+        ):
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        if request.request_id in self.requests:
+            raise ValueError(f"request ID already exists: {request.request_id!r}")
+        if request.prompt_token_ids is None:
+            raise ValueError("pin_prefix requires tokenized prompt_token_ids")
+        if request.prompt_embeds is not None or request.prompt_is_token_ids is not None:
+            raise ValueError("pin_prefix does not support prompt embeds")
+        if request.mm_features:
+            raise ValueError("pin_prefix does not support multimodal inputs")
+        if request.num_output_tokens:
+            raise ValueError("pin_prefix requires a request without output tokens")
+
+        pinned_tokens = (
+            len(request.prompt_token_ids)
+            // self.hash_block_size
+            * self.hash_block_size
+        )
+        if pinned_tokens <= 0:
+            raise ValueError(
+                "pin_prefix prompt is shorter than one prefix-match unit "
+                f"({self.hash_block_size} tokens)"
+            )
+
+        if tier == "cpu":
+            if self.connector is None:
+                raise RuntimeError("CPU prefix pinning requires a KV connector")
+            alignment = self.connector.get_prefix_pin_alignment()
+            if alignment != self.hash_block_size:
+                raise RuntimeError(
+                    "CPU prefix-pin alignment must equal prefix_match_unit: "
+                    f"connector={alignment!r}, prefix_match_unit="
+                    f"{self.hash_block_size}"
+                )
+
+        request.prompt_token_ids = request.prompt_token_ids[:pinned_tokens]
+        request.num_prompt_tokens = pinned_tokens
+        del request._all_token_ids[pinned_tokens:]
+        request.block_hashes = []
+        request.update_block_hashes()
+        request.status = RequestStatus.WAITING
+        request.resumable = False
+
+        future: Future[PrefixPinResult] = Future()
+        state = _PrefixPinState(
+            pin_id, request.request_id, tier, pinned_tokens, future
+        )
+        self._pause_ack_ready_ids.discard(request.request_id)
+        self._prefix_pins[pin_id] = state
+        self._request_to_prefix_pin[request.request_id] = pin_id
+        self.requests[request.request_id] = request
+        try:
+            if tier == "cpu":
+                assert self.connector is not None
+                # Track GPU allocations while the internal prefill runs, but
+                # reserve/force-store the CPU pin only after its source is
+                # fully computed and hard-pinned.
+                self.connector.on_new_request(request)
+            self._enqueue_waiting_request(request)
+        except Exception:
+            self.requests.pop(request.request_id, None)
+            self._request_to_prefix_pin.pop(request.request_id, None)
+            self._prefix_pins.pop(pin_id, None)
+            if tier == "cpu" and self.connector is not None:
+                self.connector.unpin_prefix(pin_id)
+            raise
+        return future
+
+    def unpin_prefix(
+        self, pin_id: str, expected_request_id: str | None = None
+    ) -> bool:
+        state = self._prefix_pins.get(pin_id)
+        if state is not None:
+            if (
+                expected_request_id is not None
+                and state.request_id != expected_request_id
+            ):
+                return False
+            self._abort_prefix_pin(state, "prefix pin was cancelled")
+            return True
+
+        tier = self._completed_prefix_pin_tiers.get(pin_id)
+        owner_request_id = self._completed_prefix_pin_request_ids.get(pin_id)
+        if (
+            expected_request_id is not None
+            and owner_request_id != expected_request_id
+        ):
+            return False
+        if tier == "cpu":
+            unpinned = self.connector is not None and self.connector.unpin_prefix(
+                pin_id
+            )
+        elif tier == "gpu":
+            unpinned = self.kv_cache_manager.unpin_prefix(pin_id)
+        else:
+            return False
+        if unpinned:
+            self._completed_prefix_pin_tiers.pop(pin_id, None)
+            self._completed_prefix_pin_request_ids.pop(pin_id, None)
+        return unpinned
+
+    def pause_prefix(self, pin_id: str) -> Future[None]:
+        state = self._prefix_pins.get(pin_id)
+        if state is None or state.request_id not in self.requests:
+            future: Future[None] = Future()
+            future.set_result(None)
+            return future
+        return self.pause_requests([state.request_id])
+
+    def resume_prefix(self, pin_id: str) -> Future[None]:
+        state = self._prefix_pins.get(pin_id)
+        if state is None or state.request_id not in self.requests:
+            future: Future[None] = Future()
+            future.set_result(None)
+            return future
+        return self.resume_requests([state.request_id])
+
+    def _complete_prefix_pin_compute(
+        self, request: Request, state: _PrefixPinState
+    ) -> None:
+        if state.pin_id not in self._prefix_pins:
+            return
+        try:
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_prompt_tokens
+            )
+            source_blocks = self.kv_cache_manager.get_blocks(request.request_id)
+            block_ids = self.kv_cache_manager.pin_request_blocks(
+                state.pin_id, request
+            )
+            state.gpu_blocks_pinned = True
+            self._remove_inflight_prefix_request(request.request_id)
+
+            if state.tier == "cpu":
+                assert self.connector is not None
+                self.connector.pin_prefix(state.pin_id, request)
+                if not self.connector.pin_request_kv_with_snapshot(
+                    state.pin_id,
+                    request,
+                    request.num_prompt_tokens,
+                    source_blocks,
+                ):
+                    raise RuntimeError(
+                        "CPU connector could not stabilize prefix-pin source"
+                    )
+
+            self._retire_prefix_pin_request(request)
+            if state.tier == "gpu":
+                self._finish_prefix_pin(
+                    state,
+                    {
+                        "pin_id": state.pin_id,
+                        "level": "gpu",
+                        "pinned_tokens": request.num_prompt_tokens,
+                        "block_ids": list(block_ids),
+                    },
+                )
+        except Exception as exc:
+            self._fail_prefix_pin(state, exc)
+
+    def _retire_prefix_pin_request(self, request: Request) -> None:
+        pin_id = self._request_to_prefix_pin.get(request.request_id)
+        pin_state = self._prefix_pins.get(pin_id) if pin_id else None
+        request.status = RequestStatus.FINISHED_STOPPED
+        self._inflight_prefills.discard(request)
+        self.encoder_cache_manager.free(request)
+        self.finished_req_ids.add(request.request_id)
+        if self.finished_req_ids_dict is not None:
+            self.finished_req_ids_dict[request.client_index].add(request.request_id)
+        if pin_state is None or pin_state.tier == "gpu":
+            self.requests.pop(request.request_id, None)
+        self.running = remove_all(self.running, {request})
+        self.waiting.remove_requests([request])
+        self.skipped_waiting.remove_requests([request])
+        self._cleanup_pause_state(request.request_id)
+
+    def _poll_prefix_pin_completions(self) -> None:
+        if self.connector is None:
+            return
+        for state in tuple(self._prefix_pins.values()):
+            if state.tier != "cpu" or not state.gpu_blocks_pinned:
+                continue
+            error = self.connector.get_prefix_pin_error(state.pin_id)
+            if error:
+                self._fail_prefix_pin(state, RuntimeError(error))
+                continue
+            if not self.connector.is_prefix_pin_ready(state.pin_id):
+                continue
+            try:
+                cpu_block_ids = self.connector.get_prefix_pin_block_ids(
+                    state.pin_id
+                )
+                self.kv_cache_manager.unpin_prefix(state.pin_id)
+                state.gpu_blocks_pinned = False
+                self.requests.pop(state.request_id, None)
+                self._finish_prefix_pin(
+                    state,
+                    {
+                        "pin_id": state.pin_id,
+                        "level": "cpu",
+                        "pinned_tokens": self._prefix_pin_num_tokens(state),
+                        "block_ids": cpu_block_ids,
+                    },
+                )
+            except Exception as exc:
+                self._fail_prefix_pin(state, exc)
+
+    def _prefix_pin_num_tokens(self, state: _PrefixPinState) -> int:
+        request = self.requests.get(state.request_id)
+        if request is not None:
+            return request.num_prompt_tokens
+        # The request is retired once its GPU source becomes stable. Its token
+        # boundary is encoded in every connector pin and remains hash-aligned.
+        # Keep it explicitly on the state for the asynchronous completion path.
+        return state.num_tokens
+
+    def _finish_prefix_pin(
+        self, state: _PrefixPinState, result: PrefixPinResult
+    ) -> None:
+        self._prefix_pins.pop(state.pin_id, None)
+        self._request_to_prefix_pin.pop(state.request_id, None)
+        self._completed_prefix_pin_tiers[state.pin_id] = state.tier
+        self._completed_prefix_pin_request_ids[state.pin_id] = state.request_id
+        if not state.future.done():
+            state.future.set_result(result)
+
+    def _fail_prefix_pin(self, state: _PrefixPinState, error: Exception) -> None:
+        if state.gpu_blocks_pinned:
+            self.kv_cache_manager.unpin_prefix(state.pin_id)
+            state.gpu_blocks_pinned = False
+        if state.tier == "cpu" and self.connector is not None:
+            self.connector.unpin_prefix(state.pin_id)
+        request = self.requests.get(state.request_id)
+        if request is not None:
+            self._remove_inflight_prefix_request(request.request_id)
+            self.kv_cache_manager.free(request)
+            self._retire_prefix_pin_request(request)
+            self.requests.pop(request.request_id, None)
+        self._prefix_pins.pop(state.pin_id, None)
+        self._request_to_prefix_pin.pop(state.request_id, None)
+        if not state.future.done():
+            state.future.set_exception(error)
+
+    def _abort_prefix_pin(self, state: _PrefixPinState, message: str) -> None:
+        self._fail_prefix_pin(state, RuntimeError(message))
+
+    @staticmethod
+    def _pause_cpu_pin_id(request_id: str) -> str:
+        return f"__vllm_request_pause__:{request_id}"
+
+    def pause_requests(self, request_ids: list[str]) -> Future[None]:
+        future: Future[None] = Future()
+        restoring_request_ids = self._resuming_cpu_pauses.intersection(request_ids)
+        if restoring_request_ids:
+            future.set_exception(
+                RuntimeError(
+                    "cannot pause requests while CPU KV restore is in progress: "
+                    f"{sorted(restoring_request_ids)!r}"
+                )
+            )
+            return future
+
+        pending_ids: set[str] = set()
+        for request_id in dict.fromkeys(request_ids):
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                continue
+            pending_ids.add(request_id)
+            if request_id in self._paused_requests:
+                if request_id not in self._pause_cpu_waiting:
+                    self._pause_ack_ready_ids.add(request_id)
+                continue
+            if request_id in self._pending_pause_req_ids:
+                continue
+
+            self._pause_resume_status[request_id] = request.status
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self.num_waiting_for_streaming_input -= 1
+            if request.status == RequestStatus.RUNNING:
+                self.running = remove_all(self.running, {request})
+            else:
+                self.waiting.remove_requests([request])
+                self.skipped_waiting.remove_requests([request])
+
+            if (
+                request.last_sched_seq > self.processed_step_seq
+                or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
+                self._pending_pause_req_ids.add(request_id)
+            else:
+                self._pause_request(request)
+
+        if not pending_ids:
+            future.set_result(None)
+            return future
+        self._pause_waiters.append((pending_ids, future))
+        self._poll_pause_cpu_backing()
+        self._flush_request_operation_waiters()
+        return future
+
+    def resume_requests(self, request_ids: list[str]) -> Future[None]:
+        future: Future[None] = Future()
+        pending_ids: set[str] = set()
+        for request_id in dict.fromkeys(request_ids):
+            if request_id in self._resuming_cpu_pauses:
+                pending_ids.add(request_id)
+                continue
+            if request_id in self._pending_pause_req_ids:
+                self._pending_resume_req_ids.add(request_id)
+                pending_ids.add(request_id)
+                continue
+            if request_id not in self._paused_requests:
+                continue
+            pending_ids.add(request_id)
+            if request_id in self._pause_cpu_waiting:
+                self._pending_resume_req_ids.add(request_id)
+            else:
+                self._resume_paused_request(request_id)
+
+        if not pending_ids:
+            future.set_result(None)
+            return future
+        self._resume_waiters.append((pending_ids, future))
+        self._flush_request_operation_waiters()
+        return future
+
+    def get_paused_request_ids(self) -> tuple[str, ...]:
+        return tuple(self._paused_requests)
+
+    def _num_occupied_request_slots(self) -> int:
+        """Count requests that still own a model-runner batch slot."""
+        gpu_resident_pause_ids = (
+            self._pending_pause_req_ids | set(self._paused_requests)
+        ) - set(self._pause_cpu_backed_tokens)
+        num_gpu_resident_pauses = sum(
+            self._pause_resume_status.get(request_id)
+            in (RequestStatus.RUNNING, RequestStatus.WAITING_FOR_STREAMING_REQ)
+            for request_id in gpu_resident_pause_ids
+        )
+        return (
+            len(self.running)
+            + self.num_waiting_for_streaming_input
+            + num_gpu_resident_pauses
+        )
+
+    def _has_free_request_slot(self) -> bool:
+        return self._num_occupied_request_slots() < self.max_num_running_reqs
+
+    def _best_effort_unpin_pause_cpu_snapshot(
+        self, request_id: str, pin_id: str
+    ) -> None:
+        connector = self.connector
+        if connector is None:
+            return
+        try:
+            connector.unpin_prefix(pin_id)
+        except Exception:
+            logger.warning(
+                "Failed to clean up partial CPU pause snapshot %s for request %s",
+                pin_id,
+                request_id,
+                exc_info=True,
+            )
+
+    def _pause_request(self, request: Request) -> None:
+        request_id = request.request_id
+        if request.is_finished():
+            self._pause_ack_ready_ids.add(request_id)
+            return
+
+        num_computed_tokens = min(
+            max(
+                request.num_computed_tokens - request.num_output_placeholders,
+                0,
+            ),
+            request.num_tokens,
+        )
+        request.num_computed_tokens = num_computed_tokens
+        request.num_output_placeholders = 0
+        request.spec_token_ids.clear()
+        if num_computed_tokens:
+            self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
+
+        self._remove_inflight_prefix_request(request_id)
+        request.status = RequestStatus.PAUSED
+        self._paused_requests[request_id] = request
+        self._pause_original_computed_tokens[request_id] = num_computed_tokens
+
+        if (
+            self.connector is not None
+            and self._pause_resume_status.get(request_id)
+            != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ):
+            # A resumable streaming wait must resume with its streaming queue
+            # and counter intact. CPU restore currently re-enters through the
+            # PREEMPTED admission path, so retain its GPU-owned request state.
+            cpu_pin_id = self._pause_cpu_pin_id(request_id)
+            if self.connector.has_pinned_prefix(cpu_pin_id):
+                logger.warning(
+                    "CPU pause pin ID %s is already owned; retaining request "
+                    "%s on GPU",
+                    cpu_pin_id,
+                    request_id,
+                )
+                self._mark_pause_ready(request_id)
+                return
+            try:
+                alignment = self.connector.get_prefix_pin_alignment()
+                if (
+                    alignment == self.hash_block_size
+                    and num_computed_tokens > 0
+                    and num_computed_tokens % alignment == 0
+                ):
+                    source_blocks = self.kv_cache_manager.get_blocks(request_id)
+                    if self.connector.pin_request_kv_with_snapshot(
+                        cpu_pin_id,
+                        request,
+                        num_computed_tokens,
+                        source_blocks,
+                    ):
+                        self._pause_cpu_pin_ids[request_id] = cpu_pin_id
+                        self._pause_cpu_waiting.add(request_id)
+                        return
+                    # A connector may reserve part of a snapshot before
+                    # reporting that it cannot complete the operation.
+                    self._best_effort_unpin_pause_cpu_snapshot(
+                        request_id, cpu_pin_id
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to create CPU backing for paused request %s; "
+                    "retaining its GPU KV state",
+                    request_id,
+                    exc_info=True,
+                )
+                self._best_effort_unpin_pause_cpu_snapshot(request_id, cpu_pin_id)
+
+        self._mark_pause_ready(request_id)
+
+    def _finalize_pending_pauses(self) -> None:
+        for request_id in tuple(self._pending_pause_req_ids):
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                self._pending_pause_req_ids.remove(request_id)
+                self._pause_ack_ready_ids.add(request_id)
+                continue
+            if request.last_sched_seq > self.processed_step_seq:
+                continue
+            original_resume_status = self._pause_resume_status[request_id]
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if request_id not in self.finished_recving_kv_req_ids:
+                    continue
+                self._update_waiting_for_remote_kv(request)
+                resume_status = (
+                    RequestStatus.PREEMPTED
+                    if request.num_preemptions
+                    else RequestStatus.WAITING
+                )
+            else:
+                # A request which was RUNNING when pause was requested can
+                # finish its current streaming chunk while the scheduler waits
+                # for that in-flight step. Resume from the post-output state,
+                # not the stale state captured by pause_requests().
+                resume_status = request.status
+
+            if (
+                resume_status == RequestStatus.WAITING_FOR_STREAMING_REQ
+                and original_resume_status
+                != RequestStatus.WAITING_FOR_STREAMING_REQ
+            ):
+                # _handle_stopped_request added this wait while the request was
+                # logically pending pause. Remove its counter contribution now
+                # and restore it only if it later resumes without queued input.
+                self.num_waiting_for_streaming_input -= 1
+            self._pause_resume_status[request_id] = resume_status
+            # _handle_stopped_request may have re-enqueued an in-flight request
+            # after pause_requests() removed it from the scheduling queues.
+            self.waiting.remove_requests([request])
+            self.skipped_waiting.remove_requests([request])
+            self._pending_pause_req_ids.remove(request_id)
+            self._pause_request(request)
+
+    def _poll_pause_cpu_backing(self) -> None:
+        if self.connector is None:
+            return
+        for request_id in tuple(self._pause_cpu_waiting):
+            pin_id = self._pause_cpu_pin_ids[request_id]
+            error = self.connector.get_prefix_pin_error(pin_id)
+            if error:
+                self.connector.unpin_prefix(pin_id)
+                self._pause_cpu_waiting.remove(request_id)
+                self._pause_cpu_pin_ids.pop(request_id, None)
+                self._mark_pause_ready(request_id)
+                continue
+            if not self.connector.is_prefix_pin_ready(pin_id):
+                continue
+            request = self._paused_requests.get(request_id)
+            self._pause_cpu_waiting.remove(request_id)
+            if request is None:
+                self.connector.unpin_prefix(pin_id)
+                self._pause_cpu_pin_ids.pop(request_id, None)
+                continue
+            backed_tokens = self._pause_original_computed_tokens[request_id]
+            self.kv_cache_manager.free(request)
+            request.num_computed_tokens = 0
+            self._pause_cpu_backed_tokens[request_id] = backed_tokens
+            self.reset_preempted_req_ids.add(request_id)
+            self._mark_pause_ready(request_id)
+
+    def _mark_pause_ready(self, request_id: str) -> None:
+        self._pause_ack_ready_ids.add(request_id)
+        if request_id in self._pending_resume_req_ids:
+            # A resume may arrive while CPU backing is still in flight. Resolve
+            # the earlier pause operation before resume clears its ack marker.
+            self._flush_request_operation_waiters()
+            self._pending_resume_req_ids.remove(request_id)
+            self._resume_paused_request(request_id)
+
+    def _resume_paused_request(self, request_id: str) -> None:
+        request = self._paused_requests.pop(request_id, None)
+        if request is None:
+            return
+        self._pause_ack_ready_ids.discard(request_id)
+        if request_id in self._pause_cpu_backed_tokens:
+            request.status = RequestStatus.PREEMPTED
+            self._resuming_cpu_pauses.add(request_id)
+            self.waiting.prepend_request(request)
+            return
+
+        resume_status = self._pause_resume_status.pop(
+            request_id, RequestStatus.WAITING
+        )
+        self._pause_original_computed_tokens.pop(request_id, None)
+        if resume_status == RequestStatus.RUNNING:
+            request.status = RequestStatus.RUNNING
+            self.running.append(request)
+        else:
+            request.status = resume_status
+            if resume_status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self.num_waiting_for_streaming_input += 1
+                assert request.streaming_queue is not None
+                if request.streaming_queue:
+                    update = request.streaming_queue.popleft()
+                    if update is None:
+                        # The stream was closed while this session was paused.
+                        self.finish_requests(
+                            request_id, RequestStatus.FINISHED_ABORTED
+                        )
+                        return
+                    self._update_request_as_session(request, update)
+            self._enqueue_waiting_request(request)
+
+    def _complete_cpu_pause_restore(self, request_id: str) -> None:
+        pin_id = self._pause_cpu_pin_ids.pop(request_id, None)
+        if pin_id is not None and self.connector is not None:
+            self.connector.unpin_prefix(pin_id)
+        self._pause_cpu_backed_tokens.pop(request_id, None)
+        self._pause_original_computed_tokens.pop(request_id, None)
+        self._pause_resume_status.pop(request_id, None)
+        self._resuming_cpu_pauses.discard(request_id)
+
+    def _complete_cpu_pause_restore_after_local_admission(
+        self, request_id: str
+    ) -> None:
+        """Release a CPU snapshot after local GPU admission succeeds.
+
+        This hook is intentionally called only after ``allocate_slots`` has
+        succeeded. At that point the GPU request table owns the locally cached
+        prefix and all remaining tokens have scheduled recomputation, so even
+        a connector which returned no external hit cannot leave resume pending.
+        """
+        if request_id in self._resuming_cpu_pauses:
+            self._complete_cpu_pause_restore(request_id)
+
+    def _cleanup_pause_state(self, request_id: str) -> None:
+        pin_id = self._pause_cpu_pin_ids.pop(request_id, None)
+        if pin_id is not None and self.connector is not None:
+            self.connector.unpin_prefix(pin_id)
+        self._paused_requests.pop(request_id, None)
+        self._pause_resume_status.pop(request_id, None)
+        self._pending_pause_req_ids.discard(request_id)
+        self._pending_resume_req_ids.discard(request_id)
+        self._pause_cpu_waiting.discard(request_id)
+        self._pause_cpu_backed_tokens.pop(request_id, None)
+        self._pause_original_computed_tokens.pop(request_id, None)
+        self._resuming_cpu_pauses.discard(request_id)
+        self._pause_ack_ready_ids.add(request_id)
+
+    def _flush_request_operation_waiters(self) -> None:
+        remaining_pause_waiters: list[tuple[set[str], Future[None]]] = []
+        for request_ids, future in self._pause_waiters:
+            if all(
+                request_id in self._pause_ack_ready_ids
+                or request_id not in self.requests
+                for request_id in request_ids
+            ):
+                if not future.done():
+                    future.set_result(None)
+            else:
+                remaining_pause_waiters.append((request_ids, future))
+        self._pause_waiters = remaining_pause_waiters
+
+        remaining_resume_waiters: list[tuple[set[str], Future[None]]] = []
+        for request_ids, future in self._resume_waiters:
+            if all(
+                request_id not in self._paused_requests
+                and request_id not in self._pending_pause_req_ids
+                and request_id not in self._pending_resume_req_ids
+                and request_id not in self._resuming_cpu_pauses
+                for request_id in request_ids
+            ):
+                if not future.done():
+                    future.set_result(None)
+            else:
+                remaining_resume_waiters.append((request_ids, future))
+        self._resume_waiters = remaining_resume_waiters
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2285,6 +3213,21 @@ class Scheduler(SchedulerInterface):
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
+            pin_id = self._request_to_prefix_pin.get(request.request_id)
+            pin_state = self._prefix_pins.get(pin_id) if pin_id else None
+            if pin_state is not None:
+                if pin_state.gpu_blocks_pinned:
+                    self.kv_cache_manager.unpin_prefix(pin_state.pin_id)
+                if pin_state.tier == "cpu" and self.connector is not None:
+                    self.connector.unpin_prefix(pin_state.pin_id)
+                self._prefix_pins.pop(pin_state.pin_id, None)
+                self._request_to_prefix_pin.pop(request.request_id, None)
+                if not pin_state.future.done():
+                    pin_state.future.set_exception(
+                        RuntimeError("prefix pin request finished before completion")
+                    )
+            self._remove_inflight_prefix_request(request.request_id)
+            self._cleanup_pause_state(request.request_id)
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
                     request.request_id not in self.finished_recving_kv_req_ids
@@ -2295,6 +3238,7 @@ class Scheduler(SchedulerInterface):
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
+        self._flush_request_operation_waiters()
         return valid_requests
 
     def _free_request(
@@ -2302,6 +3246,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        self._remove_inflight_prefix_request(request.request_id)
+        self._cleanup_pause_state(request.request_id)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2398,10 +3344,7 @@ class Scheduler(SchedulerInterface):
             return False
         # Finished requests waiting on delayed connector cleanup remain in
         # self.requests after they have been removed from scheduling queues.
-        num_in_queues = (
-            len(self.waiting) + len(self.skipped_waiting) + len(self.running)
-        )
-        return len(self.requests) > num_in_queues
+        return any(request.is_finished() for request in self.requests.values())
 
     def has_requests(self) -> bool:
         # Override the interface default to also keep the engine alive while a
@@ -2413,11 +3356,62 @@ class Scheduler(SchedulerInterface):
         return (
             self.has_unfinished_requests()
             or self.has_finished_requests()
+            # Remote-KV and CPU-offload pause handshakes are temporarily
+            # removed from the runnable queues. Keep polling until they either
+            # enter retained PAUSED state or their pause Future is failed.
+            or bool(self._pending_pause_req_ids or self._pause_cpu_waiting)
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
                 self.ec_connector is not None
                 and self.ec_connector.has_pending_push_work()
             )
+        )
+
+    def can_reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Return whether a prefix-cache reset has no scheduler blockers.
+
+        ``reset_connector`` is accepted for signature symmetry with
+        :meth:`reset_prefix_cache`. Connector-owned pins block either reset
+        mode because they may still depend on the current GPU cache state.
+        """
+        return not (
+            self._prefix_pins
+            or self.kv_cache_manager.has_pinned_prefixes()
+            or (
+                self.connector is not None
+                and self.connector.has_pinned_prefixes()
+            )
+            or self._paused_requests
+            or self._pending_pause_req_ids
+            or self._has_unsynchronized_kv_ownership()
+            or (
+                not reset_running_requests
+                and not self.kv_cache_manager.can_reset_prefix_cache()
+            )
+            or (
+                reset_running_requests
+                and self.num_waiting_for_streaming_input > 0
+            )
+            or (
+                not reset_running_requests
+                and self._inflight_prefixes.has_state()
+            )
+        )
+
+    def _has_unsynchronized_kv_ownership(self) -> bool:
+        if self.sched_step_seq > self.processed_step_seq:
+            return True
+        if any(
+            fence_seq > self.processed_step_seq
+            for fence_seq, _ in self.deferred_frees
+        ):
+            return True
+        return any(
+            request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            or request.is_finished()
+            for request in self.requests.values()
         )
 
     def reset_prefix_cache(
@@ -2430,6 +3424,32 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self._prefix_pins or self.kv_cache_manager.has_pinned_prefixes():
+            logger.warning(
+                "Failed to reset prefix cache because GPU prefix pins exist"
+            )
+            return False
+        if self.connector is not None and self.connector.has_pinned_prefixes():
+            logger.warning(
+                "Failed to reset prefix cache because CPU prefix pins exist"
+            )
+            return False
+        if self._paused_requests or self._pending_pause_req_ids:
+            logger.warning(
+                "Failed to reset prefix cache because requests are paused"
+            )
+            return False
+        if self._inflight_prefixes.has_state() and not reset_running_requests:
+            logger.warning(
+                "Failed to reset prefix cache because prefixes are in flight"
+            )
+            return False
+        if self._has_unsynchronized_kv_ownership():
+            logger.warning(
+                "Failed to reset prefix cache because KV ownership cannot be "
+                "released synchronously"
+            )
+            return False
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -2441,6 +3461,8 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp, drop_stale_output=True)
+
+            self._clear_inflight_prefixes()
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were
@@ -2551,6 +3573,19 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        for state in tuple(self._prefix_pins.values()):
+            self._fail_prefix_pin(
+                state, RuntimeError("scheduler shut down before prefix pin completed")
+            )
+        for pin_id in tuple(self._completed_prefix_pin_tiers):
+            self.unpin_prefix(pin_id)
+        for request_id in tuple(self._pause_cpu_pin_ids):
+            self._cleanup_pause_state(request_id)
+        shutdown_error = RuntimeError("scheduler shut down during request operation")
+        for _, future in self._pause_waiters + self._resume_waiters:
+            if not future.done():
+                future.set_exception(shutdown_error)
+        self._clear_inflight_prefixes()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -2685,11 +3720,40 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            load_failed = request.request_id in self.failed_recving_kv_req_ids
             self._update_waiting_for_remote_kv(request)
-            if request.num_preemptions:
+            if request.request_id in self._resuming_cpu_pauses:
+                if load_failed:
+                    # The hard CPU pin remains authoritative. Drop transient
+                    # destination ownership and retry normal lookup/load.
+                    # A zero-valid-token failure was already freed by
+                    # _update_waiting_for_remote_kv. Partial failures still
+                    # own destination blocks which must be released here.
+                    if request.num_computed_tokens > 0:
+                        self.kv_cache_manager.free(request)
+                    request.num_computed_tokens = 0
+                else:
+                    # Any successful external prefix has transferred
+                    # authoritative ownership to the GPU request table. Exact
+                    # hard-pin lookup normally restores the full snapshot;
+                    # a conservative/legacy connector may restore less, in
+                    # which case normal local scheduling recomputes the suffix.
+                    self._complete_cpu_pause_restore(request.request_id)
+                request.status = RequestStatus.PREEMPTED
+            elif request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_PREFIX:
+            if self._inflight_prefixes.has_unready_dependency(request.request_id):
+                return False
+            request.status = (
+                RequestStatus.PREEMPTED
+                if request.num_preemptions
+                else RequestStatus.WAITING
+            )
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:

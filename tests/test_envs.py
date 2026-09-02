@@ -101,14 +101,23 @@ def test_getattr_with_reset(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_envs_cache_enabled() -> None:
     assert not envs._is_envs_cache_enabled()
-    enable_envs_cache()
+    assert enable_envs_cache() is None
     assert envs._is_envs_cache_enabled()
 
     # Only wrap one-layer of cache, so we only need to
     # call disable once to reset.
-    enable_envs_cache()
-    enable_envs_cache()
-    enable_envs_cache()
+    assert enable_envs_cache() is None
+    assert enable_envs_cache() is None
+    assert enable_envs_cache() is None
+    disable_envs_cache()
+    assert not envs._is_envs_cache_enabled()
+
+
+@pytest.mark.gcc_extension
+def test_enable_envs_cache_internal_helper_tracks_transition_ownership() -> None:
+    assert not envs._is_envs_cache_enabled()
+    assert envs._enable_envs_cache_with_ownership()
+    assert not envs._enable_envs_cache_with_ownership()
     disable_envs_cache()
     assert not envs._is_envs_cache_enabled()
 

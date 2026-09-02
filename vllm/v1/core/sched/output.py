@@ -268,6 +268,13 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Internal requests that complete after this prefill and must not emit a
+    # sampled token. Prefix-pin batches are scheduler-isolated, so when this
+    # covers the whole batch the worker can bypass sampling entirely. Keep
+    # extension fields last so upstream positional construction stays stable.
+    prefill_only_req_ids: set[str] | None = None
+    skip_sampler: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

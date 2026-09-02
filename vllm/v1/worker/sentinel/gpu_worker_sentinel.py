@@ -34,15 +34,27 @@ class WorkerSentinel:
 
     def __init__(self, worker: "Worker"):
         self.worker = worker
-        self.dp_rank = worker.parallel_config.data_parallel_rank
-        self.dp_size = worker.parallel_config.data_parallel_size
-        self.data_parallel_master_ip = worker.parallel_config.data_parallel_master_ip
         all2all_backend = worker.parallel_config.all2all_backend
         if all2all_backend not in FT_BACKEND_SET:
             raise ValueError(
                 f"Fault tolerance requires an FT-capable all2all backend "
                 f"(one of {sorted(FT_BACKEND_SET)}), but got '{all2all_backend}'."
             )
+
+    @property
+    def dp_rank(self) -> int:
+        # Elastic EP mutates the worker's ParallelConfig in place.  Read the
+        # current topology for every recovery instead of retaining startup
+        # coordinates that can no longer form a valid collective.
+        return self.worker.parallel_config.data_parallel_rank
+
+    @property
+    def dp_size(self) -> int:
+        return self.worker.parallel_config.data_parallel_size
+
+    @property
+    def data_parallel_master_ip(self) -> str:
+        return self.worker.parallel_config.data_parallel_master_ip
 
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""

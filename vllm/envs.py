@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
@@ -2068,32 +2069,55 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+_ENVS_CACHE_LOCK = threading.Lock()
+
+
 def _is_envs_cache_enabled() -> bool:
     """Checked if __getattr__ is wrapped with functools.cache"""
     global __getattr__
     return hasattr(__getattr__, "cache_clear")
 
 
-def enable_envs_cache() -> None:
+def _enable_envs_cache_with_ownership() -> bool:
     """
-    Enables caching of environment variables. This is useful for performance
-    reasons, as it avoids the need to re-evaluate environment variables on
-    every call.
+    Atomically enable environment caching and report transition ownership.
 
     NOTE: Currently, it's invoked after service initialization to reduce
     runtime overhead. This also means that environment variables should NOT
     be updated after the service is initialized.
-    """
-    if _is_envs_cache_enabled():
-        # Avoid wrapping functools.cache multiple times
-        return
-    # Tag __getattr__ with functools.cache
-    global __getattr__
-    __getattr__ = functools.cache(__getattr__)
 
-    # Cache all environment variables
-    for key in environment_variables:
-        __getattr__(key)
+    Returns ``True`` only when this call installed the cache wrapper. Internal
+    in-process owners use this result to avoid undoing another component's
+    process-global cache transition during shutdown.
+    """
+    global __getattr__
+    with _ENVS_CACHE_LOCK:
+        if _is_envs_cache_enabled():
+            # Avoid wrapping functools.cache multiple times.
+            return False
+
+        original_getattr = __getattr__
+        cached_getattr = functools.cache(original_getattr)
+        __getattr__ = cached_getattr
+        try:
+            # Cache all environment variables.
+            for key in environment_variables:
+                __getattr__(key)
+        except BaseException:
+            # Do not leave a partial process-global transition behind when an
+            # environment value is invalid during cache population.
+            __getattr__ = original_getattr
+            raise
+        return True
+
+
+def enable_envs_cache() -> None:
+    """Enable caching while preserving the established ``None`` return.
+
+    Internal callers that must track transition ownership should use
+    :func:`_enable_envs_cache_with_ownership`.
+    """
+    _enable_envs_cache_with_ownership()
 
 
 def disable_envs_cache() -> None:
@@ -2102,10 +2126,11 @@ def disable_envs_cache() -> None:
     between unit tests.
     """
     global __getattr__
-    # If __getattr__ is wrapped by functions.cache, unwrap the caching layer.
-    if _is_envs_cache_enabled():
-        assert hasattr(__getattr__, "__wrapped__")
-        __getattr__ = __getattr__.__wrapped__
+    with _ENVS_CACHE_LOCK:
+        # If __getattr__ is wrapped by functions.cache, unwrap the caching layer.
+        if _is_envs_cache_enabled():
+            assert hasattr(__getattr__, "__wrapped__")
+            __getattr__ = __getattr__.__wrapped__
 
 
 def __dir__():

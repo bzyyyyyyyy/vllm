@@ -50,13 +50,21 @@ async def scale_elastic_ep(raw_request: Request):
             status_code=400, detail="new_data_parallel_size is required"
         )
 
-    if not isinstance(new_data_parallel_size, int) or new_data_parallel_size <= 0:
+    if (
+        isinstance(new_data_parallel_size, bool)
+        or not isinstance(new_data_parallel_size, int)
+        or new_data_parallel_size <= 0
+    ):
         raise HTTPException(
             status_code=400,
             detail="new_data_parallel_size must be a positive integer",
         )
 
-    if not isinstance(drain_timeout, int) or drain_timeout <= 0:
+    if (
+        isinstance(drain_timeout, bool)
+        or not isinstance(drain_timeout, int)
+        or drain_timeout <= 0
+    ):
         raise HTTPException(
             status_code=400, detail="drain_timeout must be a positive integer"
         )

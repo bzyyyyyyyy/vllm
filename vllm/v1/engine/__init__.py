@@ -5,7 +5,7 @@ import enum
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 import msgspec
 import numpy as np
@@ -25,6 +25,22 @@ from vllm.v1.serial_utils import UtilityResult
 # - "wait": Wait for in-flight requests to complete before pausing.
 # - "keep": Freeze requests in queue; they resume on resume_generation().
 PauseMode = Literal["abort", "wait", "keep"]
+
+# Physical residency guaranteed by a prefix pin.
+PrefixPinLevel = Literal["gpu", "cpu"]
+# Internal code may describe the same concept as a residency tier. Keep this
+# alias so implementation naming does not change the established public API.
+PrefixPinTier = PrefixPinLevel
+
+
+class PrefixPinResult(TypedDict):
+    """Result returned after a prefix reaches its requested residency tier."""
+
+    pin_id: str
+    level: PrefixPinLevel
+    pinned_tokens: int
+    block_ids: list[list[int]] | list[int]
+
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.

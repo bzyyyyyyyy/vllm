@@ -736,30 +736,57 @@ class ParallelConfig:
 
     @staticmethod
     def sync_dp_state(
-        dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool
-    ) -> tuple[bool, bool]:
-        """Combined all-reduce for DP state synchronization.
+        dp_group: ProcessGroup,
+        has_unfinished: bool,
+        pending_pause: bool,
+        control_op_pending: bool = False,
+        control_op_blocked: bool = False,
+        control_op_signature: int = 0,
+    ) -> tuple[bool, int, int, int, int, int]:
+        """Synchronize DP lifecycle state on the normal step cadence.
 
-        Uses a single SUM all-reduce on a 2-element tensor:
-          [0] = 1 if this rank has unfinished work, else 0.
-                SUM > 0 ≡ logical OR across ranks → any rank has work.
-          [1] = 1 if this rank has a pending pause request, else 0.
-                SUM == dp_size ≡ all ranks reached pause consensus.
+        Every rank always reduces the same six-element tensor. DP lifecycle
+        utilities only publish local intent; they never start a second
+        collective from utility dispatch, which could otherwise be ordered
+        against this cadence collective on another rank.
 
-        has_unfinished_global is true if any rank has unfinished work,
-        or if some ranks are waiting for a pause consensus.
+        The last two fields contain the sum of a packed operation signature
+        and its square. Together they let callers reject non-unanimous
+        operation kinds/parameters without adding another collective.
 
-        Returns:
-            (has_unfinished_global, pause_consensus)
+        Returns ``(has_unfinished_global, pause_count, control_op_count,
+        control_blocked_count, signature_sum, signature_square_sum)``. Partial
+        pause or control-operation participation keeps the current wave alive.
         """
+        if not control_op_pending:
+            control_op_signature = 0
         tensor = torch.tensor(
-            [int(has_unfinished), int(pending_pause)], dtype=torch.int32, device="cpu"
+            [
+                int(has_unfinished),
+                int(pending_pause),
+                int(control_op_pending),
+                int(control_op_blocked),
+                control_op_signature,
+                control_op_signature * control_op_signature,
+            ],
+            dtype=torch.int64,
+            device="cpu",
         )
         torch.distributed.all_reduce(tensor, op=ReduceOp.SUM, group=dp_group)
         dp_size = dp_group.size()
-        pause_count = tensor[1].item()
-        has_unfinished_global = tensor[0].item() > 0 or pause_count % dp_size != 0
-        return has_unfinished_global, pause_count == dp_size
+        pause_count = int(tensor[1].item())
+        control_op_count = int(tensor[2].item())
+        has_unfinished_global = bool(tensor[0].item()) or (
+            0 < pause_count < dp_size or 0 < control_op_count < dp_size
+        )
+        return (
+            has_unfinished_global,
+            pause_count,
+            control_op_count,
+            int(tensor[3].item()),
+            int(tensor[4].item()),
+            int(tensor[5].item()),
+        )
 
     @staticmethod
     def sync_kv_cache_memory_size(dp_group: ProcessGroup, kv_cache_memory: int) -> int:
@@ -848,6 +875,13 @@ class ParallelConfig:
                     "Elastic EP is not supported with pipeline parallelism "
                     f"(pipeline_parallel_size={self.pipeline_parallel_size})."
                 )
+            if self.prefill_context_parallel_size > 1:
+                raise ValueError(
+                    "Elastic EP is not supported with prefill context "
+                    "parallelism "
+                    f"(prefill_context_parallel_size="
+                    f"{self.prefill_context_parallel_size})."
+                )
             if self.data_parallel_external_lb or self.data_parallel_hybrid_lb:
                 raise NotImplementedError(
                     "Elastic EP is not compatible with data_parallel_external_lb "
@@ -903,6 +937,13 @@ class ParallelConfig:
                 )
 
         self.data_parallel_index = self.data_parallel_rank
+
+        if self.enable_elastic_ep and self.data_parallel_size <= 1:
+            raise ValueError(
+                "Elastic EP requires an initial data_parallel_size greater "
+                "than 1; scaling from a single non-DP EngineCore is not "
+                "supported."
+            )
 
         if self.distributed_executor_backend == "external_launcher":
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"

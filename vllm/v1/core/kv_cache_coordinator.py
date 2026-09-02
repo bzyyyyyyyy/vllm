@@ -297,6 +297,29 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def pin_request_blocks(self, pin_id: str, request_id: str) -> tuple[list[int], ...]:
+        for manager in self.single_type_managers:
+            manager.validate_pin_request_blocks(pin_id, request_id)
+        return tuple(
+            manager.pin_request_blocks(pin_id, request_id)
+            for manager in self.single_type_managers
+        )
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        unpinned = False
+        for manager in self.single_type_managers:
+            unpinned = manager.unpin_prefix(pin_id) or unpinned
+        return unpinned
+
+    def has_pinned_prefixes(self) -> bool:
+        return any(manager.has_pinned_prefixes() for manager in self.single_type_managers)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return any(
+            manager.has_pinned_prefix(pin_id)
+            for manager in self.single_type_managers
+        )
+
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
         Pop the request's bookkeeping from all single-type managers and

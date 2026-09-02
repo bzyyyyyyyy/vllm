@@ -4,8 +4,9 @@ import asyncio
 import os
 import socket
 import time
+import uuid
 import warnings
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from copy import copy
 from typing import Any
 
@@ -38,7 +39,12 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import (
+    EngineCoreRequest,
+    PauseMode,
+    PrefixPinLevel,
+    PrefixPinResult,
+)
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -86,6 +92,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        enable_multiprocessing: bool = True,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -98,6 +105,9 @@ class AsyncLLM(EngineClient):
             mm_registry: Multi-modal registry.
             log_requests: Whether to log requests.
             start_engine_loop: Whether to start the engine loop.
+            enable_multiprocessing: Whether to run the EngineCore in a
+                separate process. When disabled, the asynchronous in-process
+                client owns the EngineCore in a dedicated thread.
             stat_loggers: customized stat loggers for the engine.
                 If not provided, default stat loggers will be used.
                 PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
@@ -111,6 +121,7 @@ class AsyncLLM(EngineClient):
 
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
+        self._elastic_ep_scale_tasks: set[asyncio.Task[None]] = set()
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
@@ -145,8 +156,10 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
         )
 
-        # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
+        # EngineCore using the selected async backend.
+        self.engine_core = EngineCoreClient.make_client(
+            multiprocess_mode=enable_multiprocessing,
+            asyncio_mode=True,
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
@@ -171,6 +184,7 @@ class AsyncLLM(EngineClient):
         self._client_count = client_count
 
         self.output_handler: asyncio.Task | None = None
+        self._prefix_pin_cleanup_tasks: set[asyncio.Task[None]] = set()
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -215,6 +229,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        enable_multiprocessing: bool = True,
     ) -> "AsyncLLM":
         # Create the LLMEngine.
         return cls(
@@ -229,6 +244,7 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_count=client_count,
             client_index=client_index,
+            enable_multiprocessing=enable_multiprocessing,
         )
 
     @classmethod
@@ -238,6 +254,7 @@ class AsyncLLM(EngineClient):
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
+        enable_multiprocessing: bool = True,
     ) -> "AsyncLLM":
         """Create an AsyncLLM from the EngineArgs."""
 
@@ -254,24 +271,55 @@ class AsyncLLM(EngineClient):
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            enable_multiprocessing=enable_multiprocessing,
         )
 
     def __del__(self):
         self.shutdown()
 
     def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown, cleaning up the background proc and IPC."""
-        shutdown_prometheus()
+        """Shutdown the EngineCore client and frontend resources."""
+        errors: list[Exception] = []
+
+        def cleanup_resource(name: str, cleanup: Callable[[], Any]) -> None:
+            try:
+                cleanup()
+            except Exception as error:
+                logger.exception("AsyncLLM failed to clean up %s", name)
+                errors.append(error)
+
+        # Stop the EngineCore first so its timeout remains the primary error;
+        # failures in one frontend resource must not skip the other cleanups.
+        if engine_core := getattr(self, "engine_core", None):
+            cleanup_resource(
+                "EngineCore", lambda: engine_core.shutdown(timeout=timeout)
+            )
 
         if renderer := getattr(self, "renderer", None):
-            renderer.shutdown()
+            cleanup_resource("renderer", renderer.shutdown)
 
-        if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown(timeout=timeout)
+        cleanup_resource("Prometheus metrics", shutdown_prometheus)
 
         handler = getattr(self, "output_handler", None)
         if handler is not None:
-            cancel_task_threadsafe(handler)
+            cleanup_resource(
+                "output handler", lambda: cancel_task_threadsafe(handler)
+            )
+        cleanup_tasks = tuple(getattr(self, "_prefix_pin_cleanup_tasks", ()))
+        for cleanup_task in cleanup_tasks:
+            cleanup_resource(
+                "prefix pin cleanup task",
+                lambda task=cleanup_task: cancel_task_threadsafe(task),
+            )
+        scale_tasks = tuple(getattr(self, "_elastic_ep_scale_tasks", ()))
+        for scale_task in scale_tasks:
+            cleanup_resource(
+                "elastic EP scale task",
+                lambda task=scale_task: cancel_task_threadsafe(task),
+            )
+
+        if errors:
+            raise errors[0]
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
@@ -279,6 +327,117 @@ class AsyncLLM(EngineClient):
             self._supported_tasks = await self.engine_core.get_supported_tasks_async()
 
         return self._supported_tasks
+
+    async def pin_prefix(
+        self,
+        prompt: EngineCoreRequest | PromptType | EngineInput,
+        pin_id: str,
+        *,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        level: PrefixPinLevel = "gpu",
+    ) -> PrefixPinResult:
+        """Prefill and retain the prompt's hash-aligned KV prefix."""
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        if level not in ("gpu", "cpu"):
+            raise ValueError(f"unsupported prefix pin level: {level!r}")
+
+        sampling_params = SamplingParams(
+            max_tokens=1,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+        request_id = f"pin_prefix:{pin_id}:{uuid.uuid4().hex}"
+        if isinstance(prompt, EngineCoreRequest):
+            request = copy(prompt)
+            request.request_id = request_id
+            request.external_req_id = None
+        elif isinstance(prompt, dict) and "type" in prompt:
+            request = self.input_processor.process_inputs(
+                request_id,
+                prompt,
+                sampling_params,
+                supported_tasks=await self.get_supported_tasks(),
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+            )
+        else:
+            request = await self.input_processor.process_inputs_async(
+                request_id,
+                prompt,
+                sampling_params,
+                supported_tasks=await self.get_supported_tasks(),
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+            )
+
+        request.sampling_params = sampling_params
+        request.pooling_params = None
+        request.abort_immediately = False
+        self.input_processor.assign_request_id(request)
+        pin_request_id = request.request_id
+
+        pin_call = asyncio.create_task(
+            self.engine_core.pin_prefix_async(pin_id, request, level)
+        )
+        try:
+            return await asyncio.shield(pin_call)
+        except asyncio.CancelledError:
+            async def finish_pin_cleanup() -> None:
+                try:
+                    await pin_call
+                except (Exception, asyncio.CancelledError):
+                    return
+                try:
+                    await self.engine_core.unpin_prefix_async(
+                        pin_id, expected_request_id=pin_request_id
+                    )
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception(
+                        "Failed final cleanup of cancelled prefix pin %r", pin_id
+                    )
+
+            cleanup_task = asyncio.create_task(finish_pin_cleanup())
+            cleanup_tasks = getattr(self, "_prefix_pin_cleanup_tasks", None)
+            if cleanup_tasks is None:
+                cleanup_tasks = self._prefix_pin_cleanup_tasks = set()
+            cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(cleanup_tasks.discard)
+            raise
+
+    async def unpin_prefix(self, pin_id: str) -> bool:
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        return await self.engine_core.unpin_prefix_async(pin_id)
+
+    async def pause_prefix(self, pin_id: str) -> None:
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        await self.engine_core.pause_prefix_async(pin_id)
+
+    async def resume_prefix(self, pin_id: str) -> None:
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(pin_id, str):
+            raise TypeError(f"pin_id must be a string, got {type(pin_id)}")
+        await self.engine_core.resume_prefix_async(pin_id)
 
     async def add_request(
         self,
@@ -740,6 +899,32 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
 
+    async def pause(self, request_id: str | Iterable[str]) -> None:
+        """Pause requests without closing their frontend output streams.
+
+        Completion prevents subsequent scheduling, but does not fence frontend
+        delivery: output from an already-executed step may arrive afterwards.
+        """
+        if self.errored:
+            raise EngineDeadError()
+        request_ids = (
+            (request_id,) if isinstance(request_id, str) else as_list(request_id)
+        )
+        internal_ids = self.output_processor.get_internal_request_ids(request_ids)
+        if internal_ids:
+            await self.engine_core.pause_requests_async(internal_ids)
+
+    async def resume(self, request_id: str | Iterable[str]) -> None:
+        """Resume requests from their retained KV state."""
+        if self.errored:
+            raise EngineDeadError()
+        request_ids = (
+            (request_id,) if isinstance(request_id, str) else as_list(request_id)
+        )
+        internal_ids = self.output_processor.get_internal_request_ids(request_ids)
+        if internal_ids:
+            await self.engine_core.resume_requests_async(internal_ids)
+
     async def notify_kv_transfer_request_rejected(
         self,
         request_id: str,
@@ -1032,6 +1217,41 @@ class AsyncLLM(EngineClient):
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):
         """Scale the elastic EP data parallel size."""
+        if (
+            isinstance(new_data_parallel_size, bool)
+            or not isinstance(new_data_parallel_size, int)
+            or new_data_parallel_size <= 0
+        ):
+            raise ValueError("new_data_parallel_size must be a positive integer")
+        if (
+            isinstance(drain_timeout, bool)
+            or not isinstance(drain_timeout, int)
+            or drain_timeout <= 0
+        ):
+            raise ValueError("drain_timeout must be a positive integer")
+        # Acquire the serialization lock inside a shielded task.  Caller
+        # cancellation must not release it while EngineCore completes a
+        # cancellation-safe topology commit in the background.
+        scale_task = asyncio.create_task(
+            self._run_serialized_elastic_ep_scale(
+                new_data_parallel_size, drain_timeout
+            ),
+            name="AsyncLLMElasticEPScale",
+        )
+        tasks = self._elastic_ep_scale_tasks
+        tasks.add(scale_task)
+
+        def finish_scale(task: asyncio.Task[None]) -> None:
+            tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        scale_task.add_done_callback(finish_scale)
+        await asyncio.shield(scale_task)
+
+    async def _run_serialized_elastic_ep_scale(
+        self, new_data_parallel_size: int, drain_timeout: int
+    ) -> None:
         async with self._elastic_ep_lock:
             await self._scale_elastic_ep(new_data_parallel_size, drain_timeout)
 
@@ -1045,6 +1265,12 @@ class AsyncLLM(EngineClient):
                 new_data_parallel_size,
             )
             return
+
+        if self._client_count > 1:
+            raise RuntimeError(
+                "Elastic EP scaling is not supported with multiple API "
+                "frontends; use a single lifecycle-owner frontend"
+            )
 
         await self.engine_core.prepare_elastic_ep(new_data_parallel_size)
 
@@ -1066,12 +1292,16 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         set_scaling_elastic_ep(True)
-        if envs.VLLM_ELASTIC_EP_DRAIN_REQUESTS:
-            await self._drain_requests_for_elastic_ep(drain_timeout)
+        try:
+            if envs.VLLM_ELASTIC_EP_DRAIN_REQUESTS:
+                await self._drain_requests_for_elastic_ep(drain_timeout)
 
-        await self.engine_core.commit_elastic_ep()
-        self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-        set_scaling_elastic_ep(False)
+            await self.engine_core.commit_elastic_ep()
+            self.vllm_config.parallel_config.data_parallel_size = (
+                new_data_parallel_size
+            )
+        finally:
+            set_scaling_elastic_ep(False)
 
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest

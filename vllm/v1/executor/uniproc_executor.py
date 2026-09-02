@@ -54,6 +54,7 @@ class UniProcExecutor(Executor):
             distributed_init_method=distributed_init_method,
             is_driver_worker=True,
             shared_worker_lock=Lock(),
+            inproc_engine=self.inproc_engine,
         )
 
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
@@ -139,7 +140,7 @@ class UniProcExecutor(Executor):
         return
 
     def shutdown(self) -> None:
-        if worker := self.driver_worker:
+        if worker := getattr(self, "driver_worker", None):
             worker.shutdown()
 
     @classmethod

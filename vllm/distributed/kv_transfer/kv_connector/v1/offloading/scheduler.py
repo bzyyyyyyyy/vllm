@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -80,6 +80,9 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # Keep extension fields after the upstream positional constructor slots.
+    is_forced_store: bool = False
+    failed_count: int = 0
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -164,6 +167,8 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    # Keep extension fields after the upstream positional constructor slots.
+    tokens_per_hash: int
 
     @classmethod
     def from_spec(
@@ -254,6 +259,7 @@ class SchedulerOffloadConfig(NamedTuple):
                 for idx, tokens_per_block in enumerate(spec.tokens_per_block)
             ),
             blocks_per_chunk=spec.blocks_per_chunk,
+            tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
         )
 
@@ -267,6 +273,10 @@ class RequestGroupState:
     # Number of offloaded chunks hit (including GPU prefix cache)
     # when the request first started
     num_hit_chunks: int = 0
+    # One key per hash boundary. ``offload_keys`` remains the sparse list of
+    # complete offload-chunk keys used by the ordinary fast path. Keep this
+    # extension after the upstream positional constructor slots.
+    hash_offload_keys: list[OffloadKey] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -313,6 +323,14 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            for req_block_hash in islice(
+                self.req.block_hashes,
+                len(group_state.hash_offload_keys),
+                None,
+            ):
+                group_state.hash_offload_keys.append(
+                    make_offload_key(req_block_hash, group_config.group_idx)
+                )
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -479,8 +497,24 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
+        self._mamba_align_group_ids = {
+            idx
+            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_cache_mode == "align"
+        }
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # Forced stores back paused decode KV even when ordinary offloading is
+        # prompt-only. The GPU hard pin remains the source of truth until the
+        # CPU pin becomes ready.
+        self._forced_store_req_ids: dict[ReqId, int] = {}
+        self._stable_source_pin_ids: dict[ReqId, str] = {}
+        self._prefix_pin_req_ids: dict[str, ReqId] = {}
+        self._partial_pin_boundaries: dict[ReqId, int] = {}
+        self._pending_partial_pin_req_ids: set[ReqId] = set()
+        self._failed_prefix_pins: dict[str, str] = {}
+        self._deferred_prefix_unpins: set[str] = set()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -639,7 +673,10 @@ class OffloadingConnectorScheduler:
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
-        if self._sliding_window_groups:
+        stable_snapshot_restore = (
+            req_status.req.request_id in self._stable_source_pin_ids
+        )
+        if self._sliding_window_groups and not stable_snapshot_restore:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
@@ -803,6 +840,8 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
+        if request.request_id in self._req_status:
+            return
         req_context = _create_req_context(request)
         offloading_context = self.manager.on_new_request(req_context)
         req_status = RequestOffloadState(
@@ -812,6 +851,358 @@ class OffloadingConnectorScheduler:
             offloading_context=offloading_context,
         )
         self._req_status[request.request_id] = req_status
+
+    def _lookup_partial_prefix(
+        self,
+        req_status: RequestOffloadState,
+        num_computed_tokens: int,
+        num_chunk_hit_tokens: int,
+    ) -> int | None:
+        """Extend a complete-chunk hit to a hard-pinned hash boundary."""
+        if any(config.is_eagle_group for config in self.config.kv_group_configs):
+            # EAGLE must recompute its volatile trailing chunk to recover
+            # hidden state; a KV-only hash hit cannot safely restore it.
+            return num_chunk_hit_tokens
+
+        base_tokens = num_computed_tokens + num_chunk_hit_tokens
+        hash_size = self.config.tokens_per_hash
+        if base_tokens % hash_size:
+            return num_chunk_hit_tokens
+
+        max_tokens = req_status.req.num_tokens
+        stable_snapshot_restore = (
+            req_status.req.request_id in self._stable_source_pin_ids
+        )
+        if self._sliding_window_groups and not stable_snapshot_restore:
+            max_tokens -= 1
+        next_chunk_boundaries = [
+            (base_tokens // config.tokens_per_chunk + 1)
+            * config.tokens_per_chunk
+            for config in self.config.kv_group_configs
+        ]
+        max_tokens = min(max_tokens, *next_chunk_boundaries)
+        max_tokens = round_down(max_tokens, hash_size)
+        if max_tokens <= base_tokens:
+            return num_chunk_hit_tokens
+
+        saw_pending = False
+        for boundary in range(max_tokens, base_tokens, -hash_size):
+            if all(
+                boundary % config.tokens_per_chunk == 0
+                for config in self.config.kv_group_configs
+            ):
+                # Complete chunk boundaries belong to the ordinary lookup
+                # path, whose EAGLE and sliding-window reachability rules must
+                # not be bypassed here.
+                continue
+            hash_idx = boundary // hash_size - 1
+            boundary_hit = True
+            boundary_pending = False
+            for group_state in req_status.group_states:
+                if hash_idx >= len(group_state.hash_offload_keys):
+                    boundary_hit = False
+                    break
+                key = group_state.hash_offload_keys[hash_idx]
+                if not self.manager.is_prefix_key_pinned(key):
+                    boundary_hit = False
+                    break
+                result = self.manager.lookup(
+                    key,
+                    req_status.req_context,
+                )
+                if result is LookupResult.MISS:
+                    boundary_hit = False
+                    break
+                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+                    boundary_pending = True
+            if boundary_hit and not boundary_pending:
+                return boundary - num_computed_tokens
+            saw_pending |= boundary_hit and boundary_pending
+
+        return None if saw_pending else num_chunk_hit_tokens
+
+    def get_prefix_pin_alignment(self) -> int:
+        """Return the sub-block hash boundary supported by partial pins."""
+        return self.config.tokens_per_hash
+
+    def _has_eagle_groups(self) -> bool:
+        return any(config.is_eagle_group for config in self.config.kv_group_configs)
+
+    def _get_prefix_pin_keys(
+        self, req_status: RequestOffloadState, num_tokens: int | None = None
+    ) -> list[OffloadKey]:
+        """Collect exactly the chunks reachable by the connector load path."""
+        if self._has_eagle_groups():
+            raise RuntimeError("CPU prefix pin does not support EAGLE")
+        req_status.update_offload_keys()
+        if num_tokens is None:
+            num_tokens = req_status.req.num_prompt_tokens
+
+        keys: list[OffloadKey] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            num_full_chunks = min(
+                num_tokens // group_config.tokens_per_chunk,
+                len(group_state.offload_keys),
+            )
+            for chunk_idx, key in enumerate(
+                group_state.offload_keys[:num_full_chunks]
+            ):
+                if not is_store_reachable_swa_chunk(
+                    chunk_idx,
+                    num_full_chunks,
+                    group_config.alignment_chunk_count,
+                    group_config.sliding_window_size_in_chunks,
+                    False,
+                ):
+                    continue
+                keys.append(key)
+
+            if num_tokens % group_config.tokens_per_chunk:
+                hash_idx = num_tokens // self.config.tokens_per_hash - 1
+                if hash_idx < 0 or hash_idx >= len(group_state.hash_offload_keys):
+                    raise ValueError(
+                        "prefix pin boundary has no corresponding block hash"
+                    )
+                keys.append(group_state.hash_offload_keys[hash_idx])
+        return keys
+
+    def pin_prefix(self, pin_id: str, request: Request) -> list[int]:
+        if self._has_eagle_groups():
+            # An EAGLE hard pin cannot cover its volatile trailing chunk, so
+            # reporting the full prompt boundary would overstate durability.
+            raise RuntimeError("CPU prefix pin does not support EAGLE")
+        if (
+            request.num_prompt_tokens % self.config.tokens_per_hash
+            or request.num_prompt_tokens < self.config.tokens_per_hash
+        ):
+            raise ValueError(
+                "CPU prefix pin must end on a positive prefix-match boundary"
+            )
+        if request.num_prompt_tokens % self.get_prefix_pin_alignment():
+            raise ValueError("CPU prefix pin is not hash-aligned")
+        self.on_new_request(request)
+        req_status = self._req_status[request.request_id]
+        req_status.max_offload_tokens = None
+        req_status.offloading_context.policy = OffloadPolicy.REQUEST_LEVEL
+        for group_state in req_status.group_states:
+            group_state.next_stored_chunk_idx = 0
+        block_ids = self.manager.pin_prefix(
+            pin_id,
+            self._get_prefix_pin_keys(req_status),
+            req_status.req_context,
+        )
+        self._prefix_pin_req_ids[pin_id] = request.request_id
+        # Do not rely on a model step to make the request visible to the store
+        # path: a fully local GPU-cache hit may adopt its complete block table
+        # with zero scheduled tokens.
+        self._forced_store_req_ids[request.request_id] = (
+            request.num_prompt_tokens
+        )
+        if any(
+            request.num_prompt_tokens % config.tokens_per_chunk
+            for config in self.config.kv_group_configs
+        ):
+            self._partial_pin_boundaries[request.request_id] = (
+                request.num_prompt_tokens
+            )
+            self._pending_partial_pin_req_ids.add(request.request_id)
+        return block_ids
+
+    def pin_request_kv(
+        self,
+        pin_id: str,
+        request: Request,
+        num_computed_tokens: int,
+        blocks: KVCacheBlocks | None = None,
+    ) -> list[int]:
+        """Reserve CPU chunks and force-store completed request KV."""
+        if self._has_eagle_groups():
+            # Exact EAGLE pause restore needs its volatile tail, which the
+            # normal connector lookup deliberately omits. Retain this request
+            # on GPU until an exact EAGLE load path exists.
+            return []
+
+        if (
+            num_computed_tokens < self.config.tokens_per_hash
+            or num_computed_tokens % self.config.tokens_per_hash
+        ):
+            return []
+
+        # Validate ownership before creating request state or replacing its
+        # authoritative source table. A deterministic pause pin ID can collide
+        # with an unrelated user pin and must leave that owner untouched.
+        existing_req_id = self._prefix_pin_req_ids.get(pin_id)
+        if existing_req_id is not None and existing_req_id != request.request_id:
+            raise ValueError(f"prefix pin already belongs to {existing_req_id!r}")
+        if (
+            existing_req_id is not None
+            and num_computed_tokens != request.num_prompt_tokens
+        ):
+            raise ValueError("an existing prefix pin can only be upgraded in place")
+
+        snapshot_block_id_groups: tuple[list[int], ...] | None = None
+        if blocks is not None:
+            raw_block_id_groups = blocks.get_block_ids()
+            if len(raw_block_id_groups) != len(self.config.kv_group_configs):
+                raise ValueError(
+                    "CPU pin source block-table group count does not match "
+                    "the connector configuration"
+                )
+            snapshot_block_id_groups = tuple(
+                list(block_ids) for block_ids in raw_block_id_groups
+            )
+            if any(
+                len(block_ids)
+                < cdiv(num_computed_tokens, group_config.tokens_per_block)
+                for group_config, block_ids in zip(
+                    self.config.kv_group_configs,
+                    snapshot_block_id_groups,
+                    strict=True,
+                )
+            ):
+                # A hard pin reserves keys for the full requested boundary.
+                # Reject a truncated table before reserving anything: otherwise
+                # storable_chunks() silently shortens the store range and the
+                # uncovered reservations remain write-pending forever.
+                return []
+
+        self.on_new_request(request)
+        req_status = self._req_status[request.request_id]
+        if snapshot_block_id_groups is None:
+            tracked_block_id_groups = tuple(
+                list(group_state.block_ids) for group_state in req_status.group_states
+            )
+            if any(
+                len(block_ids)
+                < cdiv(num_computed_tokens, group_config.tokens_per_block)
+                for group_config, block_ids in zip(
+                    self.config.kv_group_configs,
+                    tracked_block_id_groups,
+                    strict=True,
+                )
+            ):
+                # Legacy callers may omit a snapshot only when regular
+                # allocation updates already recorded every group's complete
+                # source table.
+                return []
+
+        req_status.max_offload_tokens = None
+        req_status.offloading_context.policy = OffloadPolicy.REQUEST_LEVEL
+        if snapshot_block_id_groups is not None:
+            for group_state, block_ids in zip(
+                req_status.group_states, snapshot_block_id_groups, strict=True
+            ):
+                # Replace rather than append: this is an authoritative
+                # snapshot of every source position, including null blocks
+                # used by hybrid/SWA layouts. The regular allocation hook
+                # intentionally ignores a zero-token update, so a fully local
+                # cache hit reaches this path with no previously recorded
+                # block table.
+                group_state.block_ids = list(block_ids)
+                for block_id in block_ids:
+                    if block_id == 0:
+                        continue
+                    # Snapshot capture happens after the preceding model step
+                    # and before the next connector metadata build. Fence only
+                    # older jobs which may still read a now-adopted source;
+                    # do not classify the snapshot as a new allocation because
+                    # SWA stale-zeroing would erase its own authoritative table.
+                    pending_jobs = self._block_id_to_pending_jobs.get(block_id)
+                    if pending_jobs:
+                        self._current_batch_jobs_to_flush.update(pending_jobs)
+        for group_state in req_status.group_states:
+            group_state.next_stored_chunk_idx = 0
+        if existing_req_id is None:
+            block_ids = self.manager.pin_prefix(
+                pin_id,
+                self._get_prefix_pin_keys(req_status, num_computed_tokens),
+                req_status.req_context,
+            )
+            self._prefix_pin_req_ids[pin_id] = request.request_id
+        else:
+            block_ids = self.manager.get_prefix_pin_block_ids(pin_id)
+        self._forced_store_req_ids[request.request_id] = num_computed_tokens
+        self._stable_source_pin_ids[request.request_id] = pin_id
+        if any(
+            num_computed_tokens % config.tokens_per_chunk
+            for config in self.config.kv_group_configs
+        ):
+            self._partial_pin_boundaries[request.request_id] = num_computed_tokens
+            self._pending_partial_pin_req_ids.add(request.request_id)
+        return block_ids
+
+    def is_prefix_pin_ready(self, pin_id: str) -> bool:
+        return self.manager.is_prefix_pin_ready(pin_id)
+
+    def get_prefix_pin_error(self, pin_id: str) -> str | None:
+        return self._failed_prefix_pins.get(pin_id)
+
+    def get_prefix_pin_block_ids(self, pin_id: str) -> list[int]:
+        return self.manager.get_prefix_pin_block_ids(pin_id)
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        req_id = self._prefix_pin_req_ids.get(pin_id)
+        if req_id is None:
+            self._failed_prefix_pins.pop(pin_id, None)
+            return self.manager.unpin_prefix(pin_id)
+
+        # Prevent a force-store which has not been emitted yet.
+        self._forced_store_req_ids.pop(req_id, None)
+
+        if any(status.req_id == req_id for status in self._jobs.values()):
+            # A worker may still be reading or writing a pinned CPU block.
+            self._deferred_prefix_unpins.add(pin_id)
+            return True
+
+        self._prefix_pin_req_ids.pop(pin_id, None)
+        if self._stable_source_pin_ids.get(req_id) == pin_id:
+            self._stable_source_pin_ids.pop(req_id, None)
+        self._partial_pin_boundaries.pop(req_id, None)
+        self._pending_partial_pin_req_ids.discard(req_id)
+        self._failed_prefix_pins.pop(pin_id, None)
+        self._deferred_prefix_unpins.discard(pin_id)
+        return self.manager.unpin_prefix(pin_id)
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return self.manager.has_pinned_prefix(pin_id)
+
+    def has_pinned_prefixes(self) -> bool:
+        return self.manager.has_pinned_prefixes()
+
+    def _finish_deferred_unpins(self, req_id: ReqId) -> None:
+        if any(status.req_id == req_id for status in self._jobs.values()):
+            return
+        for pin_id in tuple(self._deferred_prefix_unpins):
+            if self._prefix_pin_req_ids.get(pin_id) != req_id:
+                continue
+            self._deferred_prefix_unpins.remove(pin_id)
+            self._prefix_pin_req_ids.pop(pin_id, None)
+            if self._stable_source_pin_ids.get(req_id) == pin_id:
+                self._stable_source_pin_ids.pop(req_id, None)
+            self._partial_pin_boundaries.pop(req_id, None)
+            self._pending_partial_pin_req_ids.discard(req_id)
+            self._failed_prefix_pins.pop(pin_id, None)
+            self.manager.unpin_prefix(pin_id)
+
+    def _pin_id_for_request(self, req_id: ReqId) -> str | None:
+        return next(
+            (
+                pin_id
+                for pin_id, pin_req_id in self._prefix_pin_req_ids.items()
+                if pin_req_id == req_id
+            ),
+            None,
+        )
+
+    def _mark_prefix_pins_failed(
+        self,
+        keys: Collection[OffloadKey],
+        error: str,
+    ) -> None:
+        for pin_id in self.manager.get_prefix_pin_ids_for_keys(keys):
+            self._failed_prefix_pins[pin_id] = error
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -850,7 +1241,8 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        stable_snapshot_restore = request.request_id in self._stable_source_pin_ids
+        if request.skip_reading_prefix_cache and not stable_snapshot_restore:
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
@@ -864,6 +1256,14 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+                num_hit_tokens = self._lookup_partial_prefix(
+                    req_status,
+                    num_computed_tokens,
+                    num_hit_tokens,
+                )
+                if num_hit_tokens is None:
+                    if req_status.deferred_lookup_start_time is None:
+                        req_status.deferred_lookup_start_time = lookup_start
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
@@ -897,7 +1297,6 @@ class OffloadingConnectorScheduler:
 
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
-            offload_keys = group_state.offload_keys
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
@@ -923,12 +1322,18 @@ class OffloadingConnectorScheduler:
                 )
 
             num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
-            assert len(offload_keys) >= num_chunks
             if num_pending_gpu_blocks:
                 start_chunk_idx = (
                     num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
                 )
-                keys_to_load.extend(offload_keys[start_chunk_idx:num_chunks])
+                for chunk_idx in range(start_chunk_idx, num_chunks):
+                    boundary = min(
+                        (chunk_idx + 1) * tokens_per_chunk,
+                        num_cached_tokens,
+                    )
+                    hash_idx = boundary // self.config.tokens_per_hash - 1
+                    assert 0 <= hash_idx < len(group_state.hash_offload_keys)
+                    keys_to_load.append(group_state.hash_offload_keys[hash_idx])
 
             dst_block_ids.extend(
                 block.block_id
@@ -943,7 +1348,9 @@ class OffloadingConnectorScheduler:
             # request-level, next_stored_chunk_idx stays at 0 so all
             # chunks (including hits) are offloaded.
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
-                group_state.next_stored_chunk_idx = num_chunks
+                group_state.next_stored_chunk_idx = (
+                    num_cached_tokens // tokens_per_chunk
+                )
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
@@ -1026,16 +1433,23 @@ class OffloadingConnectorScheduler:
     ) -> dict[int, TransferJob]:
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
-        for req_id in chain(
-            scheduler_output.num_scheduled_tokens,
-            scheduler_output.finished_req_ids or (),
-        ):
+        request_ids = dict.fromkeys(
+            chain(
+                scheduler_output.num_scheduled_tokens,
+                scheduler_output.finished_req_ids or (),
+                self._forced_store_req_ids,
+            )
+        )
+        for req_id in request_ids:
+            forced_num_tokens = self._forced_store_req_ids.pop(req_id, None)
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
             req = req_status.req
 
-            if req.status is RequestStatus.FINISHED_ABORTED:
+            if forced_num_tokens is not None:
+                num_tokens_after_batch = forced_num_tokens
+            elif req.status is RequestStatus.FINISHED_ABORTED:
                 num_tokens_after_batch = req.num_computed_tokens
             elif req.is_finished():
                 num_tokens_after_batch = req.num_tokens
@@ -1043,13 +1457,20 @@ class OffloadingConnectorScheduler:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
 
-            num_offloadable_tokens = self._calc_num_offloadable_tokens(
-                req_status, num_tokens_after_batch
-            )
+            if forced_num_tokens is not None:
+                num_offloadable_tokens = min(
+                    num_tokens_after_batch,
+                    req.num_tokens,
+                )
+            else:
+                num_offloadable_tokens = self._calc_num_offloadable_tokens(
+                    req_status, num_tokens_after_batch
+                )
 
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            forced_offload_keys: list[OffloadKey] = []
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -1076,8 +1497,6 @@ class OffloadingConnectorScheduler:
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
-                    if block_id == 0:
-                        continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
                     # trailing chunks queried by _sliding_window_lookup are
@@ -1092,29 +1511,120 @@ class OffloadingConnectorScheduler:
                         group_config.is_eagle_group,
                     ):
                         continue
+                    if forced_num_tokens is not None:
+                        # A hard pin has already reserved all reachable keys.
+                        # Include keys with an unavailable GPU source so
+                        # prepare_store exposes exactly which reservations
+                        # would otherwise remain write-pending forever.
+                        forced_offload_keys.append(offload_key)
+                    if block_id == 0:
+                        continue
                     new_offload_keys.append(offload_key)
 
-            if not new_offload_keys:
+            keys_to_prepare = (
+                forced_offload_keys
+                if forced_num_tokens is not None
+                else new_offload_keys
+            )
+            if not keys_to_prepare:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
+                keys_to_prepare, req_status.req_context
             )
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
                 logger.warning("Request %s: cannot store chunks", req_id)
+                if forced_num_tokens is not None:
+                    error = "forced CPU pin store could not allocate storage"
+                    self._mark_prefix_pins_failed(keys_to_prepare, error)
+                    pin_id = self._pin_id_for_request(req_id)
+                    if pin_id is not None:
+                        self._failed_prefix_pins[pin_id] = error
+                    self._pending_partial_pin_req_ids.discard(req_id)
+                    # This forced snapshot is terminally unusable. Do not let
+                    # a later ordinary finished-request store retry the same
+                    # source positions after the scheduler has released their
+                    # GPU ownership in response to the pin failure.
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
+
+            if forced_num_tokens is not None:
+                keys_without_source = set(store_output.keys_to_store).difference(
+                    new_offload_keys
+                )
+                if keys_without_source:
+                    error = "forced CPU pin source block is unavailable"
+                    prepared_keys = set(store_output.keys_to_store)
+                    # Cancel the whole prepared batch: no worker job will own
+                    # any of these reservations after this branch. Mark every
+                    # overlapping hard pin because shared reservations are
+                    # released together.
+                    self._mark_prefix_pins_failed(prepared_keys, error)
+                    pin_id = self._pin_id_for_request(req_id)
+                    if pin_id is not None:
+                        self._failed_prefix_pins[pin_id] = error
+                    self.manager.complete_store(
+                        prepared_keys,
+                        req_status.req_context,
+                        success=False,
+                    )
+                    self._pending_partial_pin_req_ids.discard(req_id)
+                    req_status.advance_stored_idx(num_offloadable_tokens)
+                    continue
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            self._touch(req_status)
-
             keys_to_store = set(store_output.keys_to_store)
+            if forced_num_tokens is not None:
+                source_has_internal_hole = False
+                for group_config, group_state in zip(
+                    self.config.kv_group_configs, req_status.group_states
+                ):
+                    source_started = False
+                    start_chunk_idx = group_state.next_stored_chunk_idx
+                    num_chunks = req_status.storable_chunks(
+                        group_config, group_state, num_offloadable_tokens
+                    )
+                    for chunk_idx in range(start_chunk_idx, num_chunks):
+                        if group_state.offload_keys[chunk_idx] not in keys_to_store:
+                            continue
+                        block_start = chunk_idx * blocks_per_chunk
+                        for block_id in group_state.block_ids[
+                            block_start : block_start + blocks_per_chunk
+                        ]:
+                            if block_id == 0:
+                                if source_started:
+                                    source_has_internal_hole = True
+                                    break
+                            else:
+                                source_started = True
+                        if source_has_internal_hole:
+                            break
+                    if source_has_internal_hole:
+                        break
+
+                if source_has_internal_hole:
+                    error = "forced CPU pin source block layout is non-contiguous"
+                    self._mark_prefix_pins_failed(keys_to_store, error)
+                    pin_id = self._pin_id_for_request(req_id)
+                    if pin_id is not None:
+                        self._failed_prefix_pins[pin_id] = error
+                    self.manager.complete_store(
+                        keys_to_store,
+                        req_status.req_context,
+                        success=False,
+                    )
+                    self._pending_partial_pin_req_ids.discard(req_id)
+                    req_status.advance_stored_idx(num_offloadable_tokens)
+                    continue
+
+            self._touch(req_status)
 
             group_sizes: list[int] = []
             block_indices: list[int] = []
@@ -1190,6 +1700,7 @@ class OffloadingConnectorScheduler:
                 pending_count=self.config.num_workers,
                 keys=set(keys_to_store),
                 is_store=True,
+                is_forced_store=forced_num_tokens is not None,
                 non_sliding_window_block_ids=non_sliding_window_block_ids,
                 sliding_window_block_ids=sliding_window_block_ids or None,
             )
@@ -1214,6 +1725,190 @@ class OffloadingConnectorScheduler:
                         self._current_batch_jobs_to_flush.add(job_id)
 
         return store_jobs
+
+    def _build_partial_pin_store_jobs(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> dict[int, TransferJob]:
+        """Store sub-chunk hash boundaries retained by hard CPU pins."""
+        jobs: dict[int, TransferJob] = {}
+        handoffs = scheduler_output.partial_tail_offloads or {}
+        for req_id in tuple(self._pending_partial_pin_req_ids):
+            req_status = self._req_status.get(req_id)
+            boundary = self._partial_pin_boundaries.get(req_id)
+            if req_status is None or boundary is None:
+                self._pending_partial_pin_req_ids.discard(req_id)
+                continue
+
+            handoff_groups = handoffs.get(req_id, ())
+            handoff_boundaries = {item[2] for item in handoff_groups}
+            if handoff_boundaries and handoff_boundaries != {boundary}:
+                pin_id = self._pin_id_for_request(req_id)
+                if pin_id is not None:
+                    self._failed_prefix_pins[pin_id] = (
+                        "partial-tail handoff boundary did not match the pin"
+                    )
+                self._pending_partial_pin_req_ids.discard(req_id)
+                continue
+
+            mamba_sources = {
+                group_id: block_id
+                for group_id, block_id, _ in handoff_groups
+            }
+            source_is_stable = req_id in self._stable_source_pin_ids
+            if (
+                self._mamba_align_group_ids
+                and not source_is_stable
+                and not self._mamba_align_group_ids.issubset(mamba_sources)
+            ):
+                # A producer's request-table mamba block is overwritten by
+                # its next step. Wait for the upstream CoW handoff containing
+                # the durable prompt-boundary state.
+                continue
+
+            hash_idx = boundary // self.config.tokens_per_hash - 1
+            partial_keys: list[OffloadKey] = []
+            partial_key_by_group: dict[int, OffloadKey] = {}
+            for group_config, group_state in zip(
+                self.config.kv_group_configs,
+                req_status.group_states,
+            ):
+                if boundary % group_config.tokens_per_chunk == 0:
+                    continue
+                if hash_idx < 0 or hash_idx >= len(group_state.hash_offload_keys):
+                    continue
+                key = group_state.hash_offload_keys[hash_idx]
+                partial_keys.append(key)
+                partial_key_by_group[group_config.group_idx] = key
+
+            if not partial_keys:
+                self._pending_partial_pin_req_ids.discard(req_id)
+                continue
+
+            store_output = self.manager.prepare_store(
+                partial_keys,
+                req_status.req_context,
+            )
+            if store_output is None:
+                self._mark_prefix_pins_failed(
+                    partial_keys,
+                    "partial CPU pin could not allocate storage",
+                )
+                self._pending_partial_pin_req_ids.discard(req_id)
+                continue
+
+            if not store_output.keys_to_store:
+                self._pending_partial_pin_req_ids.discard(req_id)
+                continue
+
+            keys_to_store = set(store_output.keys_to_store)
+            src_block_ids: list[int] = []
+            group_sizes: list[int] = []
+            block_indices: list[int] = []
+            source_error = False
+            for group_config, group_state in zip(
+                self.config.kv_group_configs,
+                req_status.group_states,
+            ):
+                key = partial_key_by_group.get(group_config.group_idx)
+                if key is None or key not in keys_to_store:
+                    group_sizes.append(0)
+                    block_indices.append(0)
+                    continue
+
+                boundary_block_idx = cdiv(
+                    boundary, group_config.tokens_per_block
+                ) - 1
+                if group_config.group_idx in mamba_sources:
+                    mamba_block_id = mamba_sources[group_config.group_idx]
+                    if mamba_block_id == 0:
+                        source_error = True
+                        group_block_ids = []
+                    else:
+                        group_block_ids = [mamba_block_id]
+                    start_block_idx = boundary_block_idx
+                else:
+                    start_block_idx = (
+                        boundary // group_config.tokens_per_chunk
+                    ) * self.config.blocks_per_chunk
+                    end_block_idx = boundary_block_idx + 1
+                    candidates = group_state.block_ids[
+                        start_block_idx:end_block_idx
+                    ]
+                    first_source_offset = next(
+                        (
+                            offset
+                            for offset, block_id in enumerate(candidates)
+                            if block_id != 0
+                        ),
+                        None,
+                    )
+                    if first_source_offset is None or any(
+                        block_id == 0
+                        for block_id in candidates[first_source_offset:]
+                    ):
+                        # GPULoadStoreSpec addresses a contiguous logical
+                        # range beginning at block_indices. Leading SWA nulls
+                        # can be skipped, but compressing a hole after the
+                        # first source block would shift all following KV.
+                        source_error = True
+                        group_block_ids = []
+                    else:
+                        start_block_idx += first_source_offset
+                        group_block_ids = list(candidates[first_source_offset:])
+
+                src_block_ids.extend(group_block_ids)
+                group_sizes.append(len(group_block_ids))
+                block_indices.append(start_block_idx)
+
+            if source_error:
+                self._mark_prefix_pins_failed(
+                    keys_to_store,
+                    "partial CPU pin source block is unavailable",
+                )
+                self.manager.complete_store(
+                    keys_to_store,
+                    req_status.req_context,
+                    success=False,
+                )
+                self._pending_partial_pin_req_ids.discard(req_id)
+                continue
+
+            src_spec = GPULoadStoreSpec(
+                src_block_ids,
+                group_sizes=group_sizes,
+                block_indices=block_indices,
+            )
+            job_id = self._generate_job_id()
+            if req_status.transfer_jobs:
+                any_job_id = next(iter(req_status.transfer_jobs))
+                assert self._jobs[any_job_id].is_store
+            req_status.transfer_jobs.add(job_id)
+
+            # Partial sources include off-table CoW blocks. Fence all of them
+            # immediately so a same/next-step block reuse flushes the store
+            # before the worker overwrites the source.
+            for block_id in src_block_ids:
+                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+                if block_id in self._current_batch_allocated_block_ids:
+                    self._current_batch_jobs_to_flush.add(job_id)
+
+            self._jobs[job_id] = TransferJobStatus(
+                req_id=req_id,
+                pending_count=self.config.num_workers,
+                keys=keys_to_store,
+                is_store=True,
+                is_forced_store=source_is_stable,
+                sliding_window_block_ids=src_block_ids,
+            )
+            jobs[job_id] = TransferJob(
+                req_id=req_id,
+                src_spec=src_spec,
+                dst_spec=store_output.store_spec,
+            )
+            self._pending_partial_pin_req_ids.discard(req_id)
+
+        return jobs
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -1248,9 +1943,11 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
+        store_jobs = self._build_store_jobs(scheduler_output)
+        store_jobs.update(self._build_partial_pin_store_jobs(scheduler_output))
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=self._build_store_jobs(scheduler_output),
+            store_jobs=store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
 
@@ -1262,7 +1959,10 @@ class OffloadingConnectorScheduler:
                 continue
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
-            if not req_status.transfer_jobs:
+            if (
+                not req_status.transfer_jobs
+                and req_id not in self._pending_partial_pin_req_ids
+            ):
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
@@ -1275,7 +1975,12 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            bool(self._forced_store_req_ids)
+            or bool(self._pending_partial_pin_req_ids)
+            or bool(self._jobs)
+            or self.manager.has_pending_work()
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -1319,24 +2024,39 @@ class OffloadingConnectorScheduler:
                     )
             self._connector_stats.aggregate(transfer_stats)
 
-        for job_id, count in meta.completed_jobs.items():
+        reported_job_ids = set(meta.completed_jobs) | set(meta.failed_jobs)
+        for job_id in reported_job_ids:
+            completed_count = meta.completed_jobs.get(job_id, 0)
+            failed_count = meta.failed_jobs.get(job_id, 0)
+            count = completed_count + failed_count
             assert count > 0
             if job_id < self._stale_job_threshold:
                 logger.debug(
-                    "Skipping stale completed job %d (pre-reset counter: %d)",
+                    "Skipping stale transfer job %d (pre-reset counter: %d)",
                     job_id,
                     self._stale_job_threshold,
                 )
                 continue
             job_status = self._jobs[job_id]
             job_status.pending_count -= count
+            job_status.failed_count += failed_count
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                success = job_status.failed_count == 0
+                if not success:
+                    self._mark_prefix_pins_failed(
+                        job_status.keys,
+                        "CPU KV transfer failed",
+                    )
+                self.manager.complete_store(
+                    job_status.keys,
+                    req_status.req_context,
+                    success=success,
+                )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
@@ -1354,7 +2074,12 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if req_status.finished_signaled and not req_status.transfer_jobs:
+            self._finish_deferred_unpins(job_status.req_id)
+            if (
+                req_status.finished_signaled
+                and not req_status.transfer_jobs
+                and job_status.req_id not in self._pending_partial_pin_req_ids
+            ):
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1426,8 +2151,13 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
-    def reset_cache(self) -> None:
+    def reset_cache(self) -> bool:
         """Reset the offloading manager cache, evicting all stored chunks."""
+        if self.manager.has_pinned_prefixes():
+            logger.warning(
+                "Cannot reset offloaded KV cache while CPU prefix pins exist"
+            )
+            return False
 
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
@@ -1456,6 +2186,13 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._forced_store_req_ids.clear()
+        self._stable_source_pin_ids.clear()
+        self._prefix_pin_req_ids.clear()
+        self._partial_pin_boundaries.clear()
+        self._pending_partial_pin_req_ids.clear()
+        self._failed_prefix_pins.clear()
+        self._deferred_prefix_unpins.clear()
 
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
@@ -1465,6 +2202,7 @@ class OffloadingConnectorScheduler:
         # The load flush IDs collected above must be delivered to workers.
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
+        return True
 
     def shutdown(self) -> None:
         self.manager.shutdown()

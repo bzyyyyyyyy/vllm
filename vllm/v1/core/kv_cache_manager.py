@@ -189,6 +189,8 @@ class KVCacheManager:
         # Off-table cow blocks handed to a KV connector for partial-tail
         # offload; pinned until the request's blocks are freed.
         self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
+        # Off-table partial-tail blocks transferred with a hard prefix pin.
+        self._prefix_pin_partial_tails: dict[str, list[KVCacheBlock]] = {}
 
     @property
     def usage(self) -> float:
@@ -226,12 +228,19 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+    def get_computed_blocks(
+        self,
+        request: Request,
+        max_cache_hit_length: int | None = None,
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            max_cache_hit_length: Optional upper bound for the cache lookup.
+                Prefix-only requests use the full prompt length because they
+                do not need to recompute the last token for logits.
 
         Returns:
             A tuple containing:
@@ -256,7 +265,8 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        if max_cache_hit_length is None:
+            max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -295,7 +305,9 @@ class KVCacheManager:
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
     def get_computed_blocks_for_connector(
-        self, request: Request
+        self,
+        request: Request,
+        max_cache_hit_length: int | None = None,
     ) -> tuple[KVCacheBlocks, int, int, bool]:
         """Local prefix-cache lookup for a request scheduled with a KV connector.
 
@@ -321,20 +333,22 @@ class KVCacheManager:
             and isinstance(coordinator, HybridKVCacheCoordinator)
             and coordinator.full_attention_group_id is not None
         ):
-            return *self.get_computed_blocks(request), False
+            return *self.get_computed_blocks(request, max_cache_hit_length), False
 
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0, False
 
         fa_group_id = coordinator.full_attention_group_id
+        if max_cache_hit_length is None:
+            max_cache_hit_length = request.num_tokens - 1
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes, max_cache_hit_length
         )
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
             # that every group agrees on.
-            return *self.get_computed_blocks(request), False
+            return *self.get_computed_blocks(request, max_cache_hit_length), False
 
         num_local = per_group_hits[fa_group_id]
         blocks = self.create_kv_cache_blocks(computed)
@@ -439,10 +453,14 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        if (
+            num_new_tokens == 0
+            and num_new_computed_tokens == 0
+            and num_external_computed_tokens == 0
+        ):
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
-                "external computed tokens"
+                "new computed or external computed tokens"
             )
 
         if new_computed_blocks is not None:
@@ -577,6 +595,34 @@ class KVCacheManager:
             self.block_pool.free_blocks(pins)
         self.coordinator.free(request.request_id)
 
+    def pin_request_blocks(self, pin_id: str, request: Request) -> tuple[list[int], ...]:
+        """Transfer a request's KV ownership to a hard pin."""
+        if pin_id in self._prefix_pin_partial_tails:
+            raise ValueError(f"prefix pin already exists: {pin_id!r}")
+        block_ids = self.coordinator.pin_request_blocks(pin_id, request.request_id)
+        partial_tails = self._partial_tail_pins.pop(request.request_id, None)
+        if partial_tails:
+            self._prefix_pin_partial_tails[pin_id] = partial_tails
+        return block_ids
+
+    def unpin_prefix(self, pin_id: str) -> bool:
+        unpinned = self.coordinator.unpin_prefix(pin_id)
+        partial_tails = self._prefix_pin_partial_tails.pop(pin_id, None)
+        if partial_tails:
+            self.block_pool.free_blocks(reversed(partial_tails))
+            unpinned = True
+        return unpinned
+
+    def has_pinned_prefixes(self) -> bool:
+        return bool(self._prefix_pin_partial_tails) or (
+            self.coordinator.has_pinned_prefixes()
+        )
+
+    def has_pinned_prefix(self, pin_id: str) -> bool:
+        return pin_id in self._prefix_pin_partial_tails or (
+            self.coordinator.has_pinned_prefix(pin_id)
+        )
+
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -624,6 +670,13 @@ class KVCacheManager:
         """
         self.block_pool.evict_blocks(block_ids)
 
+    def can_reset_prefix_cache(self) -> bool:
+        """Return whether reset_prefix_cache can complete without mutation."""
+        return (
+            not self.has_pinned_prefixes()
+            and self.block_pool.can_reset_prefix_cache()
+        )
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,
@@ -633,6 +686,11 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        if self.has_pinned_prefixes():
+            logger.warning(
+                "Failed to reset prefix cache because pinned prefixes are present"
+            )
+            return False
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -767,6 +825,37 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+
+    def retain_request_blocks(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        retained_block_ids: set[int],
+    ) -> list[KVCacheBlock]:
+        """Retain new computed blocks for an in-flight prefix waiter."""
+        computed_block_ids = {
+            block_id
+            for group_ids in self.get_block_ids_for_computed_tokens(
+                request_id, num_computed_tokens
+            )
+            for block_id in group_ids
+        }
+        retained = [
+            block
+            for blocks in self.get_blocks(request_id).blocks
+            for block in blocks
+            if (
+                not block.is_null
+                and block.block_id in computed_block_ids
+                and block.block_id not in retained_block_ids
+            )
+        ]
+        self.block_pool.touch(retained)
+        return retained
+
+    def release_retained_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        """Release blocks retained for in-flight prefix coordination."""
+        self.block_pool.free_blocks(reversed(blocks))
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

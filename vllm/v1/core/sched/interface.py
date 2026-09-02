@@ -3,6 +3,7 @@
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.engine import EngineCoreOutputs, PrefixPinResult, PrefixPinTier
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.metrics.stats import SchedulerStats
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -165,6 +166,45 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def pin_prefix(
+        self,
+        pin_id: str,
+        request: "Request",
+        tier: "PrefixPinTier" = "gpu",
+    ) -> Future["PrefixPinResult"]:
+        """Compute and hard-pin a token prefix at the requested tier."""
+        raise NotImplementedError
+
+    def unpin_prefix(
+        self, pin_id: str, expected_request_id: str | None = None
+    ) -> bool:
+        """Release a pin, optionally only when owned by the expected request."""
+        raise NotImplementedError
+
+    def pause_requests(self, request_ids: list[str]) -> Future[None]:
+        """Pause requests after their already-scheduled work is processed.
+
+        Completion fences subsequent scheduling, not delivery of output that
+        the completed work already produced.
+        """
+        raise NotImplementedError
+
+    def resume_requests(self, request_ids: list[str]) -> Future[None]:
+        """Restore paused requests to the scheduling queue."""
+        raise NotImplementedError
+
+    def pause_prefix(self, pin_id: str) -> Future[None]:
+        """Pause a pending prefix-pin request, if one exists."""
+        raise NotImplementedError
+
+    def resume_prefix(self, pin_id: str) -> Future[None]:
+        """Resume a paused prefix-pin request, if one exists."""
+        raise NotImplementedError
+
+    def get_paused_request_ids(self) -> tuple[str, ...]:
+        """Return request IDs retained in the per-request paused state."""
+        return ()
+
     @abstractmethod
     def get_num_unfinished_requests(self) -> int:
         """Number of unfinished requests in the scheduler's internal queue."""
@@ -220,6 +260,18 @@ class SchedulerInterface(ABC):
                 taking KV cache.
         """
         raise NotImplementedError
+
+    def can_reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Return whether a prefix-cache reset is currently safe.
+
+        This read-only preflight lets lifecycle operations reject a cache-clearing
+        sleep before aborting requests or changing the scheduler pause state.
+        Custom schedulers that retain KV outside their normal request queues should
+        override this method and report those reset blockers.
+        """
+        return True
 
     @abstractmethod
     def reset_encoder_cache(self) -> None:

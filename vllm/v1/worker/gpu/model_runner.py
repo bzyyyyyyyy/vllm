@@ -1445,6 +1445,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            skip_sampler=scheduler_output.skip_sampler,
         )
 
         if not self.is_last_pp_rank:
@@ -1467,7 +1468,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        skip_sampler = self.execute_model_state.skip_sampler
         self.execute_model_state = None
+
+        if skip_sampler:
+            self.postprocess_num_computed_tokens(input_batch)
+            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            return ModelRunnerOutput(
+                req_ids=input_batch.req_ids,
+                req_id_to_index={
+                    req_id: index
+                    for index, req_id in enumerate(input_batch.req_ids)
+                },
+                sampled_token_ids=[[] for _ in input_batch.req_ids],
+                prompt_logprobs_dict={},
+                kv_connector_output=kv_connector_output,
+            )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
@@ -1712,6 +1729,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    skip_sampler: bool = False
 
 
 def sort_batch_req_ids(
