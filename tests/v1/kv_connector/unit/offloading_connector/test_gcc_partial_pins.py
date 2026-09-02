@@ -479,6 +479,7 @@ def test_forced_store_allocation_failure_disables_later_ordinary_store() -> None
     scheduler.config = SimpleNamespace(
         blocks_per_chunk=1,
         num_workers=1,
+        offload_prompt_only=False,
         kv_group_configs=(
             SimpleNamespace(
                 alignment_chunk_count=None,

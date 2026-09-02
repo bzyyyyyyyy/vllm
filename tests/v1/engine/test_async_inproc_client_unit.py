@@ -3252,6 +3252,7 @@ def _make_elastic_ep_transaction_client() -> Any:
             data_parallel_size_local=3,
             data_parallel_rank=0,
             data_parallel_hybrid_lb=False,
+            data_parallel_external_lb=False,
             local_engines_only=False,
             enable_fault_tolerance=False,
             # Three ranks with twelve physical slots can safely scale to two
