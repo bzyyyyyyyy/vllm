@@ -40,7 +40,15 @@ else()
   set(_deepgemm_bin "${_deepgemm_fc_root}/deepgemm-build")
   set(_deepgemm_sub "${_deepgemm_fc_root}/deepgemm-subbuild")
 
-  if(EXISTS "${_deepgemm_src}/csrc/python_api.cpp")
+  vllm_prepare_pinned_fetchcontent_checkout(
+    _deepgemm_reuse
+    CACHE_ROOT "${_deepgemm_fc_root}"
+    SOURCE_DIR "${_deepgemm_src}"
+    BINARY_DIR "${_deepgemm_bin}"
+    SUBBUILD_DIR "${_deepgemm_sub}"
+    GIT_TAG "${_DEEPGEMM_UPSTREAM_TAG}"
+    REQUIRED_FILE "csrc/python_api.cpp")
+  if(_deepgemm_reuse)
     set(deepgemm_SOURCE_DIR "${_deepgemm_src}")
     set(deepgemm_BINARY_DIR "${_deepgemm_bin}")
   else()

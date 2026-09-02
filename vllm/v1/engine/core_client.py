@@ -3694,13 +3694,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     async def commit_elastic_ep(self) -> None:
         """Commit prepared elastic EP scaling."""
-        self.ensure_alive()
-        prepared = self._prepared_elastic_ep
         if getattr(self, "_elastic_ep_transaction_failed", False):
             raise RuntimeError(
                 "Elastic EP scaling cannot be retried after a failed "
                 "distributed mutation"
             )
+        self.ensure_alive()
+        prepared = self._prepared_elastic_ep
         if prepared is None:
             raise RuntimeError("Elastic EP scaling has not been prepared")
         if getattr(self, "_elastic_ep_commit_in_progress", False):
@@ -3784,6 +3784,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Prepare elastic EP scaling without routing requests to new engines."""
+        if getattr(self, "_elastic_ep_transaction_failed", False):
+            raise RuntimeError(
+                "Elastic EP scaling cannot be prepared after a failed "
+                "distributed mutation"
+            )
         self.ensure_alive()
         if (
             isinstance(new_data_parallel_size, bool)
@@ -3798,11 +3803,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             if prepared[0] == new_data_parallel_size:
                 return
             raise RuntimeError("Elastic EP scaling is already prepared")
-        if getattr(self, "_elastic_ep_transaction_failed", False):
-            raise RuntimeError(
-                "Elastic EP scaling cannot be prepared after a failed "
-                "distributed mutation"
-            )
         if (
             getattr(self, "_elastic_ep_transaction_pending", False)
             or getattr(self, "_elastic_ep_transaction_active", False)

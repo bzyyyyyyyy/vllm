@@ -39,6 +39,72 @@ function (run_python OUT EXPR ERR_MSG)
   set(${OUT} ${PYTHON_OUT} PARENT_SCOPE)
 endfunction()
 
+# Validate a generated FetchContent Git checkout before reusing it. Explicit
+# source overrides bypass this helper so developer-owned trees are never
+# modified.
+function(vllm_prepare_pinned_fetchcontent_checkout OUT_REUSE)
+  cmake_parse_arguments(PARSE_ARGV 1 ARG ""
+    "CACHE_ROOT;SOURCE_DIR;BINARY_DIR;SUBBUILD_DIR;GIT_TAG;REQUIRED_FILE" "")
+
+  foreach(_required_arg IN ITEMS
+      CACHE_ROOT SOURCE_DIR BINARY_DIR SUBBUILD_DIR GIT_TAG REQUIRED_FILE)
+    if(NOT ARG_${_required_arg})
+      message(FATAL_ERROR
+        "vllm_prepare_pinned_fetchcontent_checkout requires ${_required_arg}")
+    endif()
+  endforeach()
+
+  set(_cache_root "${ARG_CACHE_ROOT}")
+  cmake_path(ABSOLUTE_PATH _cache_root NORMALIZE)
+  foreach(_candidate_arg IN ITEMS SOURCE_DIR BINARY_DIR SUBBUILD_DIR)
+    set(_candidate "${ARG_${_candidate_arg}}")
+    cmake_path(ABSOLUTE_PATH _candidate NORMALIZE)
+    cmake_path(IS_PREFIX _cache_root "${_candidate}" NORMALIZE _inside_cache)
+    if(NOT _inside_cache OR _candidate STREQUAL _cache_root)
+      message(FATAL_ERROR
+        "Refusing to manage FetchContent path outside cache root: ${_candidate}")
+    endif()
+  endforeach()
+
+  set(_reuse FALSE)
+  if(EXISTS "${ARG_SOURCE_DIR}/${ARG_REQUIRED_FILE}")
+    find_program(_VLLM_GIT_EXECUTABLE NAMES git)
+    if(NOT _VLLM_GIT_EXECUTABLE)
+      message(FATAL_ERROR "Git is required to validate FetchContent checkouts")
+    endif()
+    execute_process(
+      COMMAND "${_VLLM_GIT_EXECUTABLE}" -C "${ARG_SOURCE_DIR}" rev-parse HEAD
+      RESULT_VARIABLE _git_result
+      OUTPUT_VARIABLE _git_head
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(
+      COMMAND "${_VLLM_GIT_EXECUTABLE}" -C "${ARG_SOURCE_DIR}"
+              submodule status --recursive
+      RESULT_VARIABLE _submodule_result
+      OUTPUT_VARIABLE _submodule_status
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_git_result EQUAL 0 AND _submodule_result EQUAL 0 AND
+       "${_git_head}" STREQUAL "${ARG_GIT_TAG}" AND
+       NOT "${_submodule_status}" MATCHES "(^|\n)[-+U]")
+      set(_reuse TRUE)
+    endif()
+  endif()
+
+  if(NOT _reuse)
+    if(EXISTS "${ARG_SOURCE_DIR}" OR EXISTS "${ARG_BINARY_DIR}" OR
+       EXISTS "${ARG_SUBBUILD_DIR}")
+      message(STATUS
+        "Discarding stale FetchContent checkout for revision ${ARG_GIT_TAG}")
+    endif()
+    file(REMOVE_RECURSE
+      "${ARG_SOURCE_DIR}" "${ARG_BINARY_DIR}" "${ARG_SUBBUILD_DIR}")
+  endif()
+
+  set(${OUT_REUSE} ${_reuse} PARENT_SCOPE)
+endfunction()
+
 # Run `EXPR` in python after importing `PKG`. Use the result of this to extend
 # `CMAKE_PREFIX_PATH` so the torch cmake configuration can be imported.
 macro (append_cmake_prefix_path PKG EXPR)

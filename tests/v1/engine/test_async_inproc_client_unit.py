@@ -27,7 +27,7 @@ import vllm.v1.engine.core_client as core_client_module
 import vllm.v1.engine.utils as engine_utils_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
 from vllm.engine.protocol import EngineClient
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
@@ -623,6 +623,9 @@ async def test_async_llm_prefix_uses_legacy_level_result_contract() -> None:
         def __init__(self) -> None:
             self.resources = SimpleNamespace(engine_dead=False)
             self.calls: list[tuple[str, str]] = []
+
+        def shutdown(self, timeout: float | None = None) -> None:
+            pass
 
         async def pin_prefix_async(
             self, pin_id: str, _request: Any, level: str
@@ -1295,6 +1298,9 @@ async def test_fake_client_shutdown_wakes_output_waiter(
 async def test_stuck_owner_shutdown_fails_output_and_utility_waiters() -> None:
     resources = InprocBackgroundResources()
     resources.bind_loop(asyncio.get_running_loop())
+    resources.engine_core = cast(
+        Any, SimpleNamespace(input_queue=queue.SimpleQueue())
+    )
     utility_future = asyncio.get_running_loop().create_future()
     resources.register_utility(17, utility_future)
     output_waiter = asyncio.create_task(resources.outputs_queue.get())
@@ -3235,6 +3241,7 @@ def _make_elastic_ep_transaction_client() -> Any:
     client._dp_fault_recovery_tasks = set()
     client._elastic_ep_notification_tasks = set()
     client._elastic_ep_shutdown_requested = False
+    client.eep_scaling_cache = None
     client._shutdown_lock = threading.RLock()
     client._shutdown_complete = False
     client._elastic_ep_routing_limit = None
@@ -3678,6 +3685,7 @@ def test_elastic_ep_rejects_single_core_initial_topology() -> None:
             data_parallel_size_local=0,
             enable_eplb=True,
             enable_elastic_ep=True,
+            eplb_config=EPLBConfig(use_async=False),
         )
 
 
@@ -3834,15 +3842,18 @@ async def test_elastic_scale_down_notification_completes_cleanup_ack(
     completion = asyncio.get_running_loop().create_future()
     calls: list[tuple[int, int]] = []
 
-    class Manager:
-        local_engine_actors = [object(), object()]
+    manager = core_client_module.CoreEngineActorManager.__new__(
+        core_client_module.CoreEngineActorManager
+    )
+    manager.local_engine_actors = [object(), object()]
 
-        def scale_down_elastic_ep(self, old_size: int, new_size: int) -> None:
-            calls.append((old_size, new_size))
-            if cleanup_fails:
-                raise RuntimeError("placement-group cleanup failed")
+    def scale_down_elastic_ep(old_size: int, new_size: int) -> None:
+        calls.append((old_size, new_size))
+        if cleanup_fails:
+            raise RuntimeError("placement-group cleanup failed")
 
-    client.resources.engine_manager = Manager()
+    manager.scale_down_elastic_ep = scale_down_elastic_ep
+    client.resources.engine_manager = manager
     client.vllm_config.parallel_config.data_parallel_size_local = 3
     client.eep_scaling_cache = core_client_module.ElasticScalingCache(
         existing_core_engines=[b"rank-0", b"rank-1", b"rank-2"],
@@ -4418,11 +4429,12 @@ def test_ray_launch_manager_constructor_failure_cleans_coordinator(
         engine_utils_module, "DPCoordinator", lambda *_args, **_kwargs: coordinator
     )
 
-    def fail_actor_manager(**_kwargs: Any) -> None:
-        raise primary_error
+    class FailingManager:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise primary_error
 
     monkeypatch.setattr(
-        engine_utils_module, "CoreEngineActorManager", fail_actor_manager
+        engine_utils_module, "CoreEngineActorManager", FailingManager
     )
     addresses = SimpleNamespace()
 
@@ -4461,19 +4473,21 @@ def test_ray_launch_body_failure_cleans_manager_then_coordinator(
             calls.append("coordinator")
 
     class Manager:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
         @staticmethod
         def shutdown() -> None:
             calls.append("manager")
 
     coordinator = Coordinator()
-    manager = Manager()
     monkeypatch.setattr(
         engine_utils_module, "DPCoordinator", lambda *_args, **_kwargs: coordinator
     )
     monkeypatch.setattr(
         engine_utils_module,
         "CoreEngineActorManager",
-        lambda **_kwargs: manager,
+        Manager,
     )
 
     with pytest.raises(RuntimeError, match="launch body failed") as exc_info:

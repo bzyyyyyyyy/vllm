@@ -32,7 +32,15 @@ else()
   set(_qutlass_bin "${_qutlass_fc_root}/qutlass-build")
   set(_qutlass_sub "${_qutlass_fc_root}/qutlass-subbuild")
 
-  if(EXISTS "${_qutlass_src}/qutlass/csrc/bindings.cpp")
+  vllm_prepare_pinned_fetchcontent_checkout(
+    _qutlass_reuse
+    CACHE_ROOT "${_qutlass_fc_root}"
+    SOURCE_DIR "${_qutlass_src}"
+    BINARY_DIR "${_qutlass_bin}"
+    SUBBUILD_DIR "${_qutlass_sub}"
+    GIT_TAG "${_QUTLASS_UPSTREAM_TAG}"
+    REQUIRED_FILE "qutlass/csrc/bindings.cpp")
+  if(_qutlass_reuse)
     set(qutlass_SOURCE_DIR "${_qutlass_src}")
     set(qutlass_BINARY_DIR "${_qutlass_bin}")
   else()

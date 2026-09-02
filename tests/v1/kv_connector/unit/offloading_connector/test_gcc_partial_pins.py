@@ -25,6 +25,15 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.gcc_extension]
 
 
 def _request_state(**attributes: object) -> RequestOffloadState:
+    attributes.setdefault("max_offload_tokens", None)
+    req = attributes.get("req")
+    req_context = attributes.get("req_context")
+    if (
+        req is not None
+        and req_context is not None
+        and not hasattr(req, "request_id")
+    ):
+        setattr(req, "request_id", getattr(req_context, "req_id"))
     return cast(
         RequestOffloadState,
         cast(object, SimpleNamespace(**attributes)),
@@ -50,6 +59,7 @@ def _scheduler(*, is_eagle_group: bool = False) -> OffloadingConnectorScheduler:
     scheduler._current_batch_allocated_block_ids = set()
     scheduler._current_batch_jobs_to_flush = set()
     scheduler._block_id_to_pending_jobs = {}
+    scheduler._stable_source_pin_ids = {}
     scheduler.manager = MagicMock()
     return scheduler
 
