@@ -43,6 +43,13 @@ Slack="https://slack.vllm.ai/"
 [project.scripts]
 vllm = "vllm.entrypoints.cli.main:main"
 
+[dependency-groups]
+gcc-test = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "tblib==3.2.2",
+]
+
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
