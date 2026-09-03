@@ -83,6 +83,11 @@ class TransferJobStatus:
     # Keep extension fields after the upstream positional constructor slots.
     is_forced_store: bool = False
     failed_count: int = 0
+    # Exact block IDs this job registered in _block_id_to_pending_jobs.
+    # Request.is_finished() is not sufficient to derive this set: internal
+    # prefix-pin requests can retire without the connector request_finished
+    # hook registering their non-sliding-window blocks.
+    pending_block_ids: set[int] = field(default_factory=set)
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -566,6 +571,14 @@ class OffloadingConnectorScheduler:
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
+
+    def _track_pending_job(
+        self, job_id: int, block_ids: Collection[int] | None
+    ) -> None:
+        job_status = self._jobs[job_id]
+        for bid in block_ids or ():
+            self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+            job_status.pending_block_ids.add(bid)
 
     def _calc_num_offloadable_tokens(
         self, req_status: RequestOffloadState, num_computed_tokens: int
@@ -1695,11 +1708,6 @@ class OffloadingConnectorScheduler:
                 assert self._jobs[any_jid].is_store
             req_status.transfer_jobs.add(job_id)
 
-            # Watch sliding window blocks as they may get evicted
-            # before the request finishes
-            for bid in sliding_window_block_ids or ():
-                self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-
             # the non-sliding window blocks will be watched only
             # when the request finishes
             self._jobs[job_id] = TransferJobStatus(
@@ -1711,6 +1719,9 @@ class OffloadingConnectorScheduler:
                 non_sliding_window_block_ids=non_sliding_window_block_ids,
                 sliding_window_block_ids=sliding_window_block_ids or None,
             )
+            # Watch sliding window blocks as they may get evicted before the
+            # request finishes.
+            self._track_pending_job(job_id, sliding_window_block_ids)
 
             store_jobs[job_id] = TransferJob(
                 req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
@@ -1726,8 +1737,8 @@ class OffloadingConnectorScheduler:
 
             if req.is_finished():
                 # Register non-sliding-window blocks for flush detection.
+                self._track_pending_job(job_id, non_sliding_window_block_ids)
                 for bid in non_sliding_window_block_ids:
-                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
                     if bid in self._current_batch_allocated_block_ids:
                         self._current_batch_jobs_to_flush.add(job_id)
 
@@ -1892,14 +1903,6 @@ class OffloadingConnectorScheduler:
                 assert self._jobs[any_job_id].is_store
             req_status.transfer_jobs.add(job_id)
 
-            # Partial sources include off-table CoW blocks. Fence all of them
-            # immediately so a same/next-step block reuse flushes the store
-            # before the worker overwrites the source.
-            for block_id in src_block_ids:
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
-                if block_id in self._current_batch_allocated_block_ids:
-                    self._current_batch_jobs_to_flush.add(job_id)
-
             self._jobs[job_id] = TransferJobStatus(
                 req_id=req_id,
                 pending_count=self.config.num_workers,
@@ -1908,6 +1911,13 @@ class OffloadingConnectorScheduler:
                 is_forced_store=source_is_stable,
                 sliding_window_block_ids=src_block_ids,
             )
+            # Partial sources include off-table CoW blocks. Fence all of them
+            # immediately so a same/next-step block reuse flushes the store
+            # before the worker overwrites the source.
+            self._track_pending_job(job_id, src_block_ids)
+            for block_id in src_block_ids:
+                if block_id in self._current_batch_allocated_block_ids:
+                    self._current_batch_jobs_to_flush.add(job_id)
             jobs[job_id] = TransferJob(
                 req_id=req_id,
                 src_spec=src_spec,
@@ -2068,19 +2078,10 @@ class OffloadingConnectorScheduler:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
-            if self._block_id_to_pending_jobs:
-                # Block IDs are scoped to KV groups, so a hybrid model may
-                # expose the same integer ID in both sliding and non-sliding
-                # groups. The pending-job index intentionally treats those as
-                # one conservative fence; remove that fence only once.
-                tracked_block_ids = set(job_status.sliding_window_block_ids or ())
-                # Non-sliding-window blocks are only tracked after
-                # request_finished, so only clean up for finished requests.
-                if req_status.req.is_finished():
-                    tracked_block_ids.update(
-                        job_status.non_sliding_window_block_ids or ()
-                    )
-                self._remove_pending_job(job_id, tracked_block_ids)
+            # Remove exactly the fences this job registered. This set is also
+            # deduplicated across hybrid KV groups whose block-ID namespaces
+            # overlap.
+            self._remove_pending_job(job_id, job_status.pending_block_ids)
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
@@ -2143,8 +2144,9 @@ class OffloadingConnectorScheduler:
         # a flush via _block_id_to_pending_jobs.
         for job_id in req_status.transfer_jobs:
             job_status = self._jobs[job_id]
-            for bid in job_status.non_sliding_window_block_ids or ():
-                self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+            self._track_pending_job(
+                job_id, job_status.non_sliding_window_block_ids
+            )
 
         return False, None
 
