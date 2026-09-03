@@ -80,6 +80,10 @@ class _CPUConnector:
         self.unpin_error = unpin_error
         self.pinned_prefixes = False
         self.pin_ids: set[str] = set()
+        self.new_requests: list[str] = []
+
+    def on_new_request(self, request: Request) -> None:
+        self.new_requests.append(request.request_id)
 
     def get_prefix_pin_alignment(self) -> int:
         return 16
@@ -216,6 +220,18 @@ def test_prefix_pin_uses_hash_unit_and_keeps_metadata_scheduler_local() -> None:
     assert request.prompt_token_ids == list(range(16))
     assert request.request_id in scheduler._request_to_prefix_pin
     assert not hasattr(request, "pin_prefix_id")
+
+
+def test_only_cpu_prefix_pins_register_with_kv_connector() -> None:
+    connector = _CPUConnector()
+    scheduler = _scheduler(connector)
+    gpu_request = _request_with_prompt(16)
+    cpu_request = _request_with_prompt(32)
+
+    scheduler.pin_prefix("gpu-pin", gpu_request, tier="gpu")
+    scheduler.pin_prefix("cpu-pin", cpu_request, tier="cpu")
+
+    assert connector.new_requests == [cpu_request.request_id]
 
 
 def test_prefix_pin_rejects_prompt_shorter_than_hash_unit() -> None:

@@ -278,6 +278,47 @@ def test_zero_step_cpu_pin_records_authoritative_source_block_table() -> None:
     assert scheduler._stable_source_pin_ids == {request.request_id: "pin"}
 
 
+@pytest.mark.parametrize("request_kind", ["new", "cached"])
+def test_req_state_update_skips_connector_exempt_internal_request(
+    request_kind: str,
+) -> None:
+    scheduler = _scheduler()
+    tracked_status = MagicMock()
+    scheduler._req_status = {"regular": tracked_status}
+    internal_id = "pin_prefix:gpu-pin:internal"
+    new_requests = []
+    cached_req_ids = []
+    cached_block_ids = []
+    if request_kind == "new":
+        new_requests = [
+            SimpleNamespace(req_id=internal_id, block_ids=([101],)),
+            SimpleNamespace(req_id="regular", block_ids=([7],)),
+        ]
+    else:
+        cached_req_ids = [internal_id, "regular"]
+        cached_block_ids = [([101],), ([7],)]
+    scheduler_output = cast(
+        SchedulerOutput,
+        cast(
+            object,
+            SimpleNamespace(
+                scheduled_new_reqs=new_requests,
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=cached_req_ids,
+                    new_block_ids=cached_block_ids,
+                    resumed_req_ids=set(),
+                ),
+            ),
+        ),
+    )
+
+    scheduler._update_req_states(scheduler_output)
+
+    tracked_status.update_offload_keys.assert_called_once_with()
+    tracked_status.update_block_id_groups.assert_called_once_with(([7],))
+    assert scheduler._current_batch_allocated_block_ids == {7}
+
+
 def test_truncated_snapshot_is_rejected_before_reservation_or_mutation() -> None:
     scheduler = _scheduler()
     manager = cast(MagicMock, scheduler.manager)

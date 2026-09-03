@@ -1387,7 +1387,12 @@ class OffloadingConnectorScheduler:
         new_block_ids_end: dict[str, tuple[int, ...]] = {}
 
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
-            req_status = self._req_status[req_id]
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                # Some scheduler-internal requests intentionally bypass the
+                # offloading connector, such as GPU-only prefix pins. They can
+                # still appear in SchedulerOutput while their KV is computed.
+                continue
             req_status.update_offload_keys()
 
             if preempted:
