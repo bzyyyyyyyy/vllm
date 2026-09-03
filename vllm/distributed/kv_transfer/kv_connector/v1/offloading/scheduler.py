@@ -558,7 +558,9 @@ class OffloadingConnectorScheduler:
         self._job_counter += 1
         return job_id
 
-    def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
+    def _remove_pending_job(
+        self, job_id: int, block_ids: Collection[int] | None
+    ) -> None:
         for bid in block_ids or ():
             pending = self._block_id_to_pending_jobs[bid]
             pending.remove(job_id)
@@ -2067,15 +2069,18 @@ class OffloadingConnectorScheduler:
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
-                # Sliding window blocks are tracked from store creation
-                # and must be cleaned up unconditionally.
-                self._remove_pending_job(job_id, job_status.sliding_window_block_ids)
+                # Block IDs are scoped to KV groups, so a hybrid model may
+                # expose the same integer ID in both sliding and non-sliding
+                # groups. The pending-job index intentionally treats those as
+                # one conservative fence; remove that fence only once.
+                tracked_block_ids = set(job_status.sliding_window_block_ids or ())
                 # Non-sliding-window blocks are only tracked after
                 # request_finished, so only clean up for finished requests.
                 if req_status.req.is_finished():
-                    self._remove_pending_job(
-                        job_id, job_status.non_sliding_window_block_ids
+                    tracked_block_ids.update(
+                        job_status.non_sliding_window_block_ids or ()
                     )
+                self._remove_pending_job(job_id, tracked_block_ids)
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)

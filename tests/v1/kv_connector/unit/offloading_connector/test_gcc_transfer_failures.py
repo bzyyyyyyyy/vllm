@@ -142,6 +142,63 @@ def test_shared_failed_key_marks_all_overlapping_prefix_pins() -> None:
     ]
 
 
+def test_completed_hybrid_store_removes_overlapping_block_fence_once() -> None:
+    scheduler = OffloadingConnectorScheduler.__new__(OffloadingConnectorScheduler)
+    req_context = ReqContext(req_id="hybrid-source")
+    stored_key = make_offload_key(b"hybrid-key", 0)
+    manager = MagicMock()
+    scheduler.manager = manager
+    scheduler._connector_stats = MagicMock()
+    scheduler._stale_job_threshold = 0
+    scheduler._jobs = {
+        9: TransferJobStatus(
+            req_id="hybrid-source",
+            pending_count=1,
+            keys={stored_key},
+            is_store=True,
+            non_sliding_window_block_ids=[8, 9],
+            sliding_window_block_ids=[8, 10],
+        )
+    }
+    req_status = cast(
+        RequestOffloadState,
+        cast(
+            object,
+            SimpleNamespace(
+                req=SimpleNamespace(is_finished=lambda: True),
+                req_context=req_context,
+                transfer_jobs={9},
+                finished_signaled=False,
+            ),
+        ),
+    )
+    scheduler._req_status = {"hybrid-source": req_status}
+    scheduler._chunks_being_loaded = None
+    scheduler._block_id_to_pending_jobs = {
+        8: {9},
+        9: {9},
+        10: {9},
+    }
+    scheduler._deferred_prefix_unpins = set()
+    scheduler._prefix_pin_req_ids = {}
+    scheduler._stable_source_pin_ids = {}
+    scheduler._partial_pin_boundaries = {}
+    scheduler._pending_partial_pin_req_ids = set()
+    scheduler._failed_prefix_pins = {}
+    connector_output = KVConnectorOutput(
+        kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={9: 1})
+    )
+
+    scheduler.update_connector_output(connector_output)
+
+    assert scheduler._block_id_to_pending_jobs == {}
+    assert scheduler._jobs == {}
+    assert req_status.transfer_jobs == set()
+    manager.complete_store.assert_called_once_with(
+        {stored_key}, req_context, success=True
+    )
+
+
 def test_partial_source_internal_hole_marks_all_overlapping_prefix_pins() -> None:
     scheduler = OffloadingConnectorScheduler.__new__(OffloadingConnectorScheduler)
     manager = MagicMock()
